@@ -2341,6 +2341,38 @@ impl State {
             crate::pipeline::builder_recorded(self.pipeline as This, false);
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.ambient(list, p);
+    }
+
+    /// After a dispatch of `p`: the ambient light ([`crate::ambient`]), if
+    /// it is the program that resolves the title's indirect light.
+    fn ambient(&self, list: &HostList, p: &HostPipeline) {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return;
+        };
+        if crate::ambient::level().is_none() {
+            return;
+        }
+        let (slot, offset) = crate::ambient::LIGHT;
+        let declared = stage.translated().used.iter().any(|u| {
+            u.kind == ResourceType::Uav && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+        });
+        let view = declared
+            .then(|| match self.compute.get(usize::from(slot)) {
+                Some(Root::Table(table)) => crate::descriptor::view(table + u64::from(offset) * 4),
+                _ => None,
+            })
+            .flatten();
+        let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
+        match placed.as_ref().map_or(view.as_ref(), |p| Some(&p.view)) {
+            Some(&View::Unordered(resource, ..)) if resource != 0 => {
+                crate::ambient::raise(list, resource as This);
+            }
+            _ => {
+                crate::ambient::COUNTS[2].fetch_add(1, Ordering::Relaxed);
+                once!(declared, "no ambient light: the resolve's output view was not found");
+            }
+        }
     }
 
     #[cfg(feature = "diagnostics")]

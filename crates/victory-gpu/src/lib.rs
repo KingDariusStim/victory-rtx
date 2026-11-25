@@ -56,6 +56,8 @@ mod memory;
 mod shadow;
 #[cfg(windows)]
 mod standin;
+#[cfg(windows)]
+mod ambient;
 pub mod signature;
 #[cfg(windows)]
 mod texture;

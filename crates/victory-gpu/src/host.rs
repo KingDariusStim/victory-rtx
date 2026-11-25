@@ -7027,6 +7027,15 @@ impl Meter {
                     stand_in[5]
                 );
             }
+            let ambient = crate::ambient::COUNTS.each_ref().map(|c| c.load(Ordering::Relaxed));
+            if ambient.iter().any(|&n| n > 0) {
+                tracing::info!(
+                    "ambient light: set after {} light resolves; {} outputs of another format, {} resolves without the output view",
+                    ambient[0],
+                    ambient[1],
+                    ambient[2]
+                );
+            }
             let heap = crate::descriptor::host::VIEW_HEAP_USE.each_ref().map(|c| c.load(Ordering::Relaxed));
             if heap[1] > 0 {
                 tracing::info!(

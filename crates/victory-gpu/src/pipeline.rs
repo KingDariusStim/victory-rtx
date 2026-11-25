@@ -61,8 +61,25 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// It resolves the title's indirect diffuse light, which gets the
+    /// ambient light after it ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+}
+
+/// Whether `bytes` (a container) is the program that resolves the title's
+/// indirect diffuse light ([`crate::ambient::PROGRAM`]); logged once.
+#[cfg(windows)]
+fn resolves_light(bytes: &[u8], hash: &str) -> bool {
+    let found = bytes
+        .windows(crate::ambient::PROGRAM.len())
+        .any(|w| w == crate::ambient::PROGRAM);
+    if found {
+        tracing::info!(hash, "the indirect light resolve program is here (ambient light follows it)");
+    }
+    found
 }
 
 impl std::fmt::Debug for Shader {
@@ -107,9 +124,12 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let hash = full.to_hex()[..16].to_owned();
             Arc::new(Shader {
                 stage,
-                hash: full.to_hex()[..16].to_owned(),
+                #[cfg(windows)]
+                resolves_light: resolves_light(bytes, &hash),
+                hash,
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
@@ -130,6 +150,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         stage,
         hash: full.to_hex()[..16].to_owned(),
         container: container.to_vec(),
+        resolves_light: false,
         translated: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
