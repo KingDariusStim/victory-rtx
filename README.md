@@ -1,3 +1,31 @@
+# victory-rtx: a modified version of DexNom Runtime
+
+> **Modified version.** This repository is a modified version of
+> [DexNom/VIctory](https://github.com/DexNom/VIctory) (DexNom Runtime), itself a fork of
+> [Marvisak/VIctory](https://github.com/Marvisak/VIctory). It is distributed under the same
+> license, GPL-3.0-or-later ([LICENSE](LICENSE)), with no warranty. The changes made here, from
+> 2026-11-25, target NVIDIA GPUs (tested on an RTX 2080 SUPER) and are recorded in the git history
+> of the `nvidia` branch, which starts from DexNom commit `921d8d3` and merges DexNom's `main`:
+>
+> - GPU conversion of copies between 16-bit colour textures and their 8-bit stand-ins
+>   (`crates/victory-gpu/src/standin.rs`), instead of skipping them;
+> - D3D12 debug-layer messages logged as they happen; descriptor-heap and stand-in counters in
+>   the periodic report; `VICTORY_DYNAMIC_VIEWS`; the heap-size probe asks D3D12 first;
+> - audio-decoder counters and failure logging (`crates/victory-hle/src/modules/apu.rs`);
+> - tests: a 32-lane variant of a wave64 test, a race fixed in an in-place memory test;
+> - a Windows run kit with a log summarizer (`tools/runkit`).
+>
+> **No game content.** This repository contains no game files, code or assets, and none are
+> distributed: you need your own legally obtained copy, and everything is derived from it on your
+> own machine. The BCPack format tables the decoder needs are separately supplied data outside
+> this license and are not included (`Initialize-FormatTables.ps1` fetches a hash-verified copy
+> from the upstream project). See [docs/asset-policy.md](docs/asset-policy.md).
+>
+> **Not affiliated.** This project is not affiliated with, endorsed by or connected to the game's
+> developer or publisher, Microsoft or Xbox, or NVIDIA. All trademarks belong to their owners.
+>
+> The original DexNom README follows unchanged.
+
 # DexNom Runtime
 
 DexNom Runtime is a community fork of Marvisak's VIctory for Windows x64. It runs an Xbox Series executable from your own game installation and translates its GPU work for Direct3D 12. It builds on the Radeon runtime tested at `e061c69032b84ec6e2ec17340469cd689500dafd` and adds fixes for static sampler selection, wave64 lane masks and integer render targets. Game files, executables, saves and generated shader caches stay on your own computer.
