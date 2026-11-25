@@ -104,8 +104,11 @@ if ($voices.Count) {
 }
 
 Write-Section 'GPU failures'
-$fail = @($lines | Where-Object { $_ -match 'DEVICE_HUNG|DEVICE_REMOVED|device removed|removal reason|host GPU failure|DXGI_ERROR|page fault' })
-if ($fail.Count) { $fail | Select-Object -First $Top | ForEach-Object { Write-Host $_ } } else { Write-Host '(none)' }
+$fail = @($lines | Where-Object { $_ -match 'DEVICE_HUNG|DEVICE_REMOVED|host GPU failure|host GPU device removed|(0x887A000[0-9])' })
+if ($fail.Count) {
+    $fail | Select-Object -First 4 | ForEach-Object { $t = $_; if ($t.Length -gt 400) { $t = $t.Remove(400) + ' ...' }; Write-Host $t }
+    Write-Host "($($fail.Count) lines; DXGI_ERROR_DEVICE_HUNG is the GPU timeout (TDR): also caused by unstable overclocks)"
+} else { Write-Host '(none)' }
 
 Write-Section 'D3D12 debug layer'
 $d3d = @($lines | Where-Object { $_ -match 'D3D12: ' })

@@ -11,10 +11,9 @@ $DataDir = Join-Path $env:LOCALAPPDATA 'victory-runkit'
 # pipelines, which grow with play. A big, fast drive is best.
 $CacheDir = 'D:\victory-cache'
 
-# Switches every run gets (Run-Victory.ps1 -Set adds or overrides per run).
-# On NVIDIA: the per-draw descriptor slots peaked near 70,000 of 262,144 while
-# the game's own slots nearly filled the 1,000,000-view heap, so fewer
-# per-draw slots leave the game more room.
-$Defaults = @{
-    VICTORY_DYNAMIC_VIEWS = '131072'
-}
+# Switches every run gets (Run-Victory.ps1 -Set adds or overrides per run),
+# e.g. @{ VICTORY_AMBIENT = 'off' }.
+# Do not lower VICTORY_DYNAMIC_VIEWS on NVIDIA: in a 16-minute run the
+# per-draw slots peaked at 204,014 of 262,144 while the game used 737,853 of
+# its 737,855; the 1,000,000-view heap is full either way (needs remapping).
+$Defaults = @{}

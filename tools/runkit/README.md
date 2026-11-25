@@ -50,6 +50,9 @@ Backspace=B, Esc=Menu). Close the window to end a run; the summary prints after.
   run, while graphics pipelines are built. Audio works (music and dialogue arrive late while
   streaming is slow). Areas lit only by bounce light are black: the game's ray-traced indirect
   light does not run yet.
-- The game's view heap is 1,245,184 slots; NVIDIA allows 1,000,000. With the default split the
-  game used 737,179 of the 737,855 slots it gets, so run with `VICTORY_DYNAMIC_VIEWS=131072`
-  (in `settings.example.ps1`).
+- The game's view heap is 1,245,184 slots; NVIDIA allows 1,000,000. In a 16-minute run the
+  game used 737,853 of the 737,855 slots it gets and the runtime's per-draw slots peaked at
+  204,014 of 262,144: the heap is full on both sides, so moving the split does not help. The fix
+  is remapping the game's slots onto the host heap (open work).
+- That run ended in `DXGI_ERROR_DEVICE_HUNG` (the GPU timeout) when a +100 MHz overclock was
+  applied mid-run. Test at stock clocks, so overclock instability is not mistaken for a runtime bug.
