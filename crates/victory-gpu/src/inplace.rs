@@ -1393,6 +1393,11 @@ mod tests {
             assert!(same(start as *const u8, &got), "the GPU reads the title buffer's bytes");
             rig.store(&placed.buffer, placed.bias + 16, &[0xa5; 64]).unwrap();
             assert!(same((start + 16) as *const u8, &[0xa5; 64]), "the GPU's write is at the title's address");
+            // The rig's list and allocator still name the placed buffer from
+            // its last store: released with it, so the memory is no heap's
+            // when it is decommitted (else the decommit failed now and then
+            // with other tests on the device).
+            drop(rig);
             drop(placed);
             // Half of it decommitted: turned down, the host not asked.
             assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
