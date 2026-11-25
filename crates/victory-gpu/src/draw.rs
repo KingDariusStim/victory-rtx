@@ -21,6 +21,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
 use crate::host::HostList;
+use crate::memory::Writes;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
@@ -34,6 +35,55 @@ enum Root {
     Constants(Vec<u32>),
     /// A root view's GPU address.
     View(u64),
+}
+
+/// The constants visible to this stage, at their translated user-data positions.
+/// Preserve gaps so unrelated dwords retained from previous root layouts cannot
+/// be taken for adjacent halves of a guest pointer.
+fn raw_constants(roots: &[Root], words: &[victory_shader::emit::UserData]) -> Vec<u32> {
+    let mut constants = Vec::new();
+    for word in words.iter().filter(|word| word.root == RootType::Constants) {
+        let Some(Root::Constants(values)) = roots.get(usize::from(word.slot)) else { continue };
+        let Some(&value) = values.get(word.dword as usize) else { continue };
+        let index = word.index as usize;
+        if index >= constants.len() {
+            constants.resize(index + 1, 0);
+        }
+        constants[index] = value;
+    }
+    constants
+}
+
+/// Raw stores in these four compute containers are dword atomics at fixed
+/// offsets from addresses in cb0. The rest of each builder's results use
+/// ordinary root UAVs. The hash identifies the container and its root layout.
+fn builder_raw_writes(hash: &str, roots: &[Root]) -> Writes {
+    let (slot, header_offset, header_bytes, centroid) = match hash {
+        "f6e47efa50226beb" => (8, 12, 28, true), // LoadTriangles
+        "190fbf0ebe040169" => (3, 12, 28, true), // LoadInstances
+        "5062bc7a48e842f8" => (8, 16, 24, true), // ReloadTriangles
+        "35e51bb27a463294" => (4, 12, 4, false), // SplitInstances
+        _ => return Writes::All,
+    };
+    let Some(Root::Constants(words)) = roots.get(slot) else {
+        return Writes::All;
+    };
+    let address = |word: usize| -> Option<u64> {
+        Some(u64::from(*words.get(word)?) | u64::from(*words.get(word + 1)?) << 32)
+    };
+    let Some(header) = address(0) else { return Writes::All };
+    let extra = if centroid {
+        let Some(address) = address(4) else { return Writes::All };
+        (address, 24)
+    } else {
+        (0, 0)
+    };
+    // Valid dword atomics cannot straddle a directory page. Retain broad
+    // publication for unaligned inputs whose device behavior is unspecified.
+    if (header | extra.0) & 3 != 0 {
+        return Writes::All;
+    }
+    Writes::Ranges([(header.wrapping_add(header_offset), header_bytes), extra])
 }
 
 #[repr(C)]
@@ -899,13 +949,13 @@ impl State {
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
     fn memory_ready(
-        &self, list: &HostList, compute: bool, writes: bool, shader: &victory_shader::emit::HostShader,
+        &self, list: &HostList, compute: bool, writes: Writes, shader: &victory_shader::emit::HostShader,
     ) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
-        let (mut addresses, mut constants) = (Vec::new(), Vec::new());
+        let mut addresses = Vec::new();
         // A traversal that reads the address table already prefetches the
         // next cell for trees crossing that boundary. Other raw shaders
         // request just the known headers in memory::ready.
@@ -923,13 +973,13 @@ impl State {
                 addresses.push(address);
             }
         }
-        for root in self.roots_ref(compute) {
-            match root {
-                Root::View(address) => addresses.push(*address),
-                Root::Constants(values) => constants.extend_from_slice(values),
-                _ => {}
+        let roots = self.roots_ref(compute);
+        for root in roots {
+            if let Root::View(address) = root {
+                addresses.push(*address);
             }
         }
+        let constants = raw_constants(roots, &shader.user_data);
         crate::memory::ready(list, heap, &addresses, &constants, writes)
     }
 
@@ -1044,7 +1094,8 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
-    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, direct_builder: bool) -> bool {
+        let compute = p.compute;
         // Depth planes this list's shaders wrote (the material classes):
         // drawn into their planes by a pass of ours before anything of the
         // title's is set, so what reads them next finds them.
@@ -1122,7 +1173,13 @@ impl State {
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 // The shader can read the scene through guest addresses and
                 // write its result to a texture or a separate root UAV.
-                let raw_writes = publish && (t.host.writes_guest_memory || !write_skip());
+                let raw_writes = if !publish || (write_skip() && !t.host.writes_guest_memory) {
+                    Writes::None
+                } else if direct_builder && write_skip() {
+                    builder_raw_writes(&stage.shader.hash, self.roots_ref(compute))
+                } else {
+                    Writes::All
+                };
                 let Some(ready) = self.memory_ready(list, compute, raw_writes, &t.host) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
@@ -1146,6 +1203,21 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
+                }
+                if !compute && crate::material_demand::enabled()
+                    && let Some(fields) = crate::material_demand::fields(&stage.shader.hash)
+                    && t.host.user_data.iter().any(|u| u.index == 8 && u.root == RootType::Table && u.slot == 0)
+                    && let Some(u) = t.host.user_data.iter().find(|u| u.index == 14 && u.root == RootType::Constants)
+                    && let Some(Root::Constants(words)) = self.roots_ref(false).get(usize::from(u.slot))
+                    && let Some(&record) = words.get(u.dword as usize)
+                    && let Some(Root::Table(table)) = self.roots_ref(false).first()
+                    && let Some(heap) = self.heap_of(*table)
+                    && !heap.samplers()
+                    && let Some(&bound) = values.get(8)
+                    && Some(u64::from(bound)) == table.checked_sub(heap.start)
+                    && crate::material_demand::wants(heap, record, fields)
+                {
+                    crate::material_demand::record(list, heap, *table, record, fields);
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
@@ -1844,7 +1916,11 @@ impl State {
             HEAP_TEXTURES_RECHECKED[1].fetch_add(changed, Ordering::Relaxed);
             HEAP_TEXTURES_RECHECKED[2].store(waiting, Ordering::Relaxed);
         }
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        let wanted = crate::material_demand::enabled().then(|| host.material_demand.take(heap, host, frame));
+        let (mut due, census) = host.texture_slots_due(frame, 4096);
+        if let Some(wanted) = wanted {
+            crate::material_demand::promote(&mut due, &wanted, frame);
+        }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1910,7 +1986,7 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
-        for (index, write) in due {
+        for (index, write, recovered) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
             }
@@ -1932,10 +2008,14 @@ impl State {
                 // another texture's.
                 let len = crate::resource::placed_bytes_from(&resource, crate::resource::first_mip(&desc)).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                if recovered && !host.material_upload_allowed(index, write, address, len, mapped) {
+                    host.texture_slot_done(index, write, None);
+                    continue;
+                }
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
-                    host.texture_slot_gone(index);
+                    host.texture_slot_gone(index, write);
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
@@ -1979,24 +2059,20 @@ impl State {
                 host.texture_slot_done(index, write, None);
                 continue;
             };
-            let _residence;
-            let view = if room {
-                host.mirror(index, handle, true)
-            } else {
-                let upload = reupload_when_full()
-                    .then(|| host.mirror_resident(index, handle))
-                    .and_then(Result::ok);
-                let Some((view, pin)) = upload else {
-                    // Give ready uploads and unmapped slots behind this one
-                    // their turn before retrying the blocked prefix.
-                    host.texture_slot_later(index, write, frame, most);
-                    refused += 1;
-                    if refused > 256 {
-                        break;
-                    }
-                    continue;
-                };
-                _residence = pin;
+            let upload = (room || reupload_when_full())
+                .then(|| host.mirror_queued(index, handle, write, !room))
+                .and_then(Result::ok);
+            let Some((view, _residence)) = upload else {
+                // Give ready uploads and unmapped slots behind this one
+                // their turn before retrying the blocked prefix.
+                host.texture_slot_later(index, write, frame, most);
+                refused += 1;
+                if refused > 256 {
+                    break;
+                }
+                continue;
+            };
+            if !room && view.is_some() {
                 let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
                 if n == 1 || n.is_multiple_of(500) {
                     tracing::info!(
@@ -2005,8 +2081,7 @@ impl State {
                         "a texture already on the card is brought up to date although the card has no room for new ones"
                     );
                 }
-                view
-            };
+            }
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().map(|p| &p.view).or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -2197,7 +2272,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        if !self.bind(list, p, builder) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -2530,7 +2605,7 @@ impl State {
             .take(90)
             .collect();
         let queue = match heap.host() {
-            Some(h) => h.texture_slot_state(index, crate::frame::current()),
+            Some(h) => h.texture_slot_state(index, crate::frame::current(), title.as_ref()),
             None => "no host heap".into(),
         };
         format!(
@@ -3359,7 +3434,8 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            // An indirect record can supply arguments only available to the GPU.
+            DISPATCH => self.bind(list, p, false),
             _ => false,
         };
         if !ran {
@@ -3788,6 +3864,63 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_address_candidates_use_only_the_current_stages_constants() {
+        use victory_shader::emit::UserData;
+        let roots = [
+            Root::Constants(vec![0xaabb_ffff, 0xdead_beef, 0x7654_3210]),
+            Root::Constants(vec![0x34, 0x0800_0000]),
+            Root::Constants(vec![0xff, 0xffff_ffff]),
+        ];
+        let input = |index, slot, dword| UserData { index, slot, root: RootType::Constants, dword };
+        let words = [
+            input(7, 1, 0), input(6, 0, 2), input(2, 0, 0), input(8, 1, 1),
+            UserData { root: RootType::Table, ..input(3, 2, 0) },
+        ];
+        // Only 6 and 7 make the adjacent low/high dwords of the pointer.
+        // The stale root and the unread dword between 2 and 6 cannot name a cell.
+        assert_eq!(raw_constants(&roots, &words), [0, 0, 0xaabb_ffff, 0, 0, 0, 0x7654_3210, 0x34, 0x0800_0000]);
+    }
+
+    #[test]
+    fn bounded_builder_raw_writes_use_the_bound_compute_constants() {
+        let mut state = State::default();
+        let header = 0xd_7227a400;
+        let centroid = 0x10_0b622280;
+        for (hash, slot, from, bytes, has_centroid) in [
+            ("f6e47efa50226beb", 8, 12, 28, true),
+            ("190fbf0ebe040169", 3, 12, 28, true),
+            ("5062bc7a48e842f8", 8, 16, 24, true),
+            ("35e51bb27a463294", 4, 12, 4, false),
+        ] {
+            state.set_constants(true, slot, &[header as u32, (header >> 32) as u32], 0);
+            if has_centroid {
+                state.set_constants(true, slot, &[centroid as u32, (centroid >> 32) as u32], 4);
+            }
+            let extra = if has_centroid { (centroid, 24) } else { (0, 0) };
+            assert_eq!(
+                builder_raw_writes(hash, state.roots_ref(true)),
+                Writes::Ranges([(header + from, bytes), extra]),
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_builder_raw_writes_fall_back_for_indirect_or_missing_addresses() {
+        let hash = "f6e47efa50226beb";
+        let mut roots = vec![Root::None; 9];
+        assert_eq!(builder_raw_writes(hash, &roots[..8]), Writes::All);
+        roots[8] = Root::View(0x10000);
+        assert_eq!(builder_raw_writes(hash, &roots), Writes::All);
+        roots[8] = Root::Constants(vec![0, 5, 0, 0, 4]); // Missing centroid high dword.
+        assert_eq!(builder_raw_writes(hash, &roots), Writes::All);
+        roots[8] = Root::Constants(vec![2, 5, 0, 0, 0, 0]); // Unaligned atomic address.
+        assert_eq!(builder_raw_writes(hash, &roots), Writes::All);
+        roots[8] = Root::Constants(vec![0; 6]);
+        assert_eq!(builder_raw_writes("3cea4534bbc15632", &roots), Writes::All); // InitHeaders
+        assert_eq!(builder_raw_writes("0000000000000000", &roots), Writes::All);
+    }
 
     #[test]
     fn thread_dimensions_use_the_kernels_declared_group_size() {

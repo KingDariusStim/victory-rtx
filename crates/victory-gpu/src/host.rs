@@ -1883,9 +1883,7 @@ struct Deferred {
     texture_backs: Vec<crate::texback::Back>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
-    /// Work once the list has run (diagnostics: what read-back buffers
-    /// hold, `HostList::defer_after`).
-    #[cfg(feature = "diagnostics")]
+    /// Work once the GPU has completed the list and its readbacks are visible.
     after: Vec<Box<dyn Fn() + Send>>,
 }
 
@@ -2238,7 +2236,56 @@ fn late_writes() -> bool {
 
 /// Per host copy, the ranges a submission's shaders may write, as declared
 /// (address, end).
-type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+type Declared<T = crate::shadow::Shadow> = (std::sync::Arc<T>, Vec<(usize, usize)>);
+
+/// Keep copies and their ranges in first-declaration order. Only the lookup
+/// uses a hash table. The vector owns an Arc for every indexed address.
+struct WriteGroups<T> {
+    groups: Vec<Declared<T>>,
+    positions: std::collections::HashMap<usize, usize>,
+}
+
+impl<T> WriteGroups<T> {
+    fn new() -> Self {
+        Self { groups: Vec::new(), positions: std::collections::HashMap::new() }
+    }
+
+    fn add(&mut self, shadow: &std::sync::Arc<T>, ranges: &[(usize, usize)]) {
+        use std::collections::hash_map::Entry;
+        match self.positions.entry(std::sync::Arc::as_ptr(shadow) as usize) {
+            Entry::Vacant(entry) => {
+                entry.insert(self.groups.len());
+                self.groups.push((shadow.clone(), ranges.to_vec()));
+            }
+            Entry::Occupied(entry) => {
+                let existing = &mut self.groups[*entry.get()].1;
+                for range in ranges {
+                    if !existing.contains(range) {
+                        existing.push(*range);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn shadow_write_groups_preserve_owner_identity_and_first_seen_range_order() {
+    use std::sync::Arc;
+    let first = Arc::new(0);
+    let second = Arc::new(0); // A new backing for the same guest address.
+    let mut writes = WriteGroups::new();
+    writes.add(&first, &[(20, 30), (0, 10)]);
+    writes.add(&second, &[(0, 10)]);
+    writes.add(&first.clone(), &[(0, 10), (9, 22), (20, 30)]);
+    writes.add(&second, &[(0, 10), (20, 30)]);
+    assert_eq!(writes.groups.len(), 2);
+    assert!(Arc::ptr_eq(&writes.groups[0].0, &first));
+    assert!(Arc::ptr_eq(&writes.groups[1].0, &second));
+    assert_eq!(writes.groups[0].1, [(20, 30), (0, 10), (9, 22)]);
+    assert_eq!(writes.groups[1].1, [(0, 10), (20, 30)]);
+}
 
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
@@ -2514,19 +2561,15 @@ fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool) -> Optio
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> bool {
-    use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
-    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    let mut spans = Batch::default();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
             {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
-                }
+                spans.add(shadow, *address, *len);
             }
         }
     }
@@ -2536,9 +2579,9 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
         let mut runs_left = 512;
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        return spans.refreshes.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
-    spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+    spans.refreshes.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -3038,24 +3081,18 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
-fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
-    let mut back: Vec<Declared> = Vec::new();
+fn declared_writes(runs: &[&HostList], card_only: bool) -> Vec<Declared> {
+    let mut back = WriteGroups::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
-                let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
-                    }
-                    None => back.push((shadow.clone(), vec![range])),
-                }
+            if let Step::GpuWrite(shadow, address, len) = step
+                && (!card_only || shadow.carded())
+            {
+                back.add(shadow, &[(*address, *address + *len)]);
             }
         }
     }
-    back
+    back.groups
 }
 
 /// The walls trace (`VICTORY_WALLS_TRACE=1` or `2`; off by default): log
@@ -3084,7 +3121,6 @@ fn read_backs(list: &HostList) {
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
     }
-    #[cfg(feature = "diagnostics")]
     for work in &list.deferred().after {
         work();
     }
@@ -3614,24 +3650,7 @@ impl Host {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
-        let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && shadow.carded()
-                {
-                    let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
-                        }
-                        None => declared.push((shadow.clone(), vec![range])),
-                    }
-                }
-            }
-        }
+        let declared = declared_writes(runs, true);
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -4027,22 +4046,13 @@ impl Host {
                     flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 let owners = writeback_owners(flights.iter().copied());
                 self.relay_card_back(&plans, fetch, &owners);
-                let mut back: Vec<Declared> = Vec::new();
+                let mut back = WriteGroups::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => back.push((shadow.clone(), ranges.clone())),
-                        }
+                        back.add(shadow, ranges);
                     }
                 }
-                relay_hand_back(&back, &owners);
+                relay_hand_back(&back.groups, &owners);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
@@ -4469,7 +4479,7 @@ impl Host {
                     _ => None,
                 }));
                 let mut seen = std::collections::HashSet::new();
-                let mut back: Vec<Declared> = Vec::new();
+                let mut back = WriteGroups::new();
                 for item in &items {
                     let Late::Run(flight) = item else {
                         continue;
@@ -4478,19 +4488,10 @@ impl Host {
                         self.card_back(card, submitted, &mut seen, &owners);
                     }
                     for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => back.push((shadow.clone(), ranges.clone())),
-                        }
+                        back.add(shadow, ranges);
                     }
                 }
-                hand_back(&back, &owners);
+                hand_back(&back.groups, &owners);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
@@ -4708,7 +4709,7 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
-            let back = declared_writes(runs);
+            let back = declared_writes(runs, false);
             let mut texture_writes = Vec::new();
             for list in runs {
                 texture_writes.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::destination));
@@ -4839,7 +4840,7 @@ impl Host {
                 &owners,
             );
         }
-        let back = declared_writes(runs);
+        let back = declared_writes(runs, false);
         hand_back(&back, &owners);
         crate::writeback::published(this_submission);
         if let Some(card) = card {
@@ -5723,8 +5724,7 @@ impl HostList {
     }
 
     /// Runs `work` once the list has run, with its read-backs
-    /// (diagnostics: logging what a read-back buffer of ours holds).
-    #[cfg(feature = "diagnostics")]
+    /// Use this for readback results that are consumed after GPU completion.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
     }

@@ -69,6 +69,7 @@ translation_inputs! {
     "emit/sampler.rs",
     "emit/shader.rs",
     "emit/threading.rs",
+    "emit/typed_views.rs",
     "emit/validator.rs",
     "emit/wave.rs",
     "gfx10/fields.rs",

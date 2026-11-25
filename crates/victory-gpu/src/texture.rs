@@ -474,12 +474,12 @@ pub(crate) fn host_written(resource: This) {
     if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
         // SAFETY: 56 bytes in the description's layout.
         let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
-        let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
+        let bytes = crate::resource::placed_bytes(&words).unwrap_or(u64::MAX);
         if !at.is_null() && bytes > 0 {
             HOST_WRITTEN_AT
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
+                .insert((at as u64, resource as usize), (bytes, words[4], words[6], words[7], words[8]));
         }
     }
 }
@@ -487,8 +487,13 @@ pub(crate) fn host_written(resource: This) {
 /// The title memory of textures the host copied into, by address: bytes
 /// and description words 4, 6, 7 and 8 (width, height, layers and levels,
 /// format).
-static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u32, u32, usize)>> =
+static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<(u64, usize), (u64, u32, u32, u32, u32)>> =
     Mutex::new(std::collections::BTreeMap::new());
+
+pub(crate) fn host_written_overlaps(start: u64, end: u64) -> bool {
+    let writes = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+    writes.range(..(end, 0)).rev().any(|(&(base, _), entry)| base.saturating_add(entry.0) > start)
+}
 
 /// A texture the title placed at `address` (description words `desc`) was
 /// made: says so once if it lies in the memory of a texture the host
@@ -499,12 +504,13 @@ static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u3
 pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
     let hit = {
         let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
-        map.range(..=address)
-            .next_back()
-            .filter(|(at, d)| address < **at + d.0)
-            .map(|(at, d)| (*at, *d))
+        map.range(..=(address, usize::MAX)).next_back().and_then(|(&(at, _), _)| {
+            map.range((at, 0)..=(at, usize::MAX)).find_map(|(_, &d)| {
+                (address < at.saturating_add(d.0)).then_some((at, d))
+            })
+        })
     };
-    if let Some((at, (bytes, width, height, layers_levels, format, _))) = hit {
+    if let Some((at, (bytes, width, height, layers_levels, format))) = hit {
         static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::warn!(
@@ -538,18 +544,14 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
 }
 
 /// The title released a resource.
-pub(crate) fn forget(resource: usize) {
+pub(crate) fn forget(resource: usize, address: u64) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
+    if HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|set| set.remove(&resource)) {
+        HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).remove(&(address, resource));
     }
-    // Its memory may be given to other textures now (run 177: most of the
-    // "HERO LEAD" lines were views in memory a released texture had held).
-    HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != resource);
     let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(through) = through.as_mut() {
         through.remove(&resource);

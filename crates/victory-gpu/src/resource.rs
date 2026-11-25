@@ -1159,6 +1159,8 @@ type Made = (std::sync::Arc<HostTexture>, Option<std::sync::Arc<Twin>>);
 /// copy is the card's.
 #[cfg(windows)]
 struct Hosted {
+    /// Calculated only when a material needs to exclude GPU-owned overlapping memory.
+    guest_end: std::sync::OnceLock<u64>,
     /// The host copy (and twin) once made. Taken out again only by
     /// [`let_go_idle`] and when the title releases the resource.
     made: std::sync::Mutex<Option<Made>>,
@@ -1200,8 +1202,18 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 /// title places in that memory in another format shows ([`alias_of`]). A
 /// texture leaves the table before it is freed.
 #[cfg(windows)]
-static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
+static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(windows)]
+pub(crate) fn writable_texture_overlaps(start: u64, end: u64) -> bool {
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    targets.range(..end).rev().any(|(&at, owners)| owners.iter().any(|&object| {
+        let r = resource(object as This);
+        let target_end = r.host.guest_end.get_or_init(|| footprint(&r.desc).map_or(u64::MAX, |f| at.saturating_add(f.size)));
+        *target_end > start
+    }))
+}
 
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
@@ -1249,7 +1261,7 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     }
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
+    let other = *targets.get(&(r.data() as u64))?.last()? as This;
     let o = resource(other);
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
@@ -2033,6 +2045,7 @@ fn hand_out_resource(
         backing,
         #[cfg(windows)]
         host: Hosted {
+            guest_end: Default::default(),
             made: std::sync::Mutex::new(None),
             state,
             // SAFETY: the title passes a whole clear value (the format,
@@ -2052,10 +2065,13 @@ fn hand_out_resource(
         if !fills(&desc) {
             let address = resource.data() as u64;
             let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+            // The preferred writer stays last: title allocations take precedence over
+            // address-only views. Keep every live alias for its own guest extent.
+            let owners = targets.entry(address).or_default();
             if matches!(resource.backing, Backing::ViewAddress(_)) {
-                targets.entry(address).or_insert(at);
+                owners.insert(0, at);
             } else {
-                targets.insert(address, at);
+                owners.push(at);
             }
         }
         if !lazy() {
@@ -2080,8 +2096,9 @@ impl Drop for Resource {
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
-                if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
-                    targets.remove(&at);
+                if let Some(owners) = targets.get_mut(&at) {
+                    owners.retain(|&object| object != std::ptr::from_ref::<Resource>(self) as usize);
+                    if owners.is_empty() { targets.remove(&at); }
                 }
             }
         }
@@ -2116,7 +2133,7 @@ impl Drop for Resource {
                 crate::host::retire(twin);
             }
         }
-        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize, self.data() as u64);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
@@ -2387,7 +2404,7 @@ pub(crate) fn first_mip(view: &[u32]) -> u32 {
 }
 
 #[cfg(windows)]
-fn placed_key(mut key: [u32; 14]) -> [u32; 14] {
+pub(crate) fn placed_key(mut key: [u32; 14]) -> [u32; 14] {
     // Words 1 and 13 of the description are the filler of its layout
     // (after the dimension, and at the end): the title leaves there what
     // its stack held, and two views of one texture that differed only in
@@ -2466,7 +2483,7 @@ pub(crate) fn writable_texture_at(address: u64, words: &[u32; 14]) -> Option<Res
     }
     let find = || {
         let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-        let target = *targets.get(&address)? as This;
+        let target = *targets.get(&address)?.last()? as This;
         if !object::try_add_ref(target) {
             return Some(None);
         }
