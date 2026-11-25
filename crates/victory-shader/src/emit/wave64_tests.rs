@@ -176,6 +176,20 @@ fn partial_thread_dispatch_masks_the_final_groups_memory_writes() {
 /// execute. Both copied words must still describe all 64 console lanes.
 #[test]
 fn copied_mask_keeps_both_numeric_words_inside_a_lane_branch() {
+    copied_mask_on_host_waves_of(64);
+}
+
+/// The same program on a host of 32-lane waves (NVIDIA), where the console
+/// wave is two host waves: the mask's high word is the other host wave's
+/// lanes, read through the exchange. Either it translates and the card gives
+/// the console's words, or the translator refuses it (which the game's
+/// programs of this shape then meet too).
+#[test]
+fn copied_mask_keeps_both_numeric_words_on_waves_of_32() {
+    copied_mask_on_host_waves_of(32);
+}
+
+fn copied_mask_on_host_waves_of(host_wave: u32) {
     let native = native(&[
         0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
         0xBE94_046A, // s_mov_b64 s[20:21], vcc
@@ -196,14 +210,36 @@ fn copied_mask_keeps_both_numeric_words_inside_a_lane_branch() {
         0xBEFE_040C, // restore: s_mov_b64 exec, s[12:13]
     ]);
     let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let shader = lowered_for_width(&native, &p, &HashSet::new(), 64).expect("lower");
+    let shader = match lowered_for_width(&native, &p, &HashSet::new(), host_wave) {
+        Ok(shader) => shader,
+        // As a run translates it: the driver's other forms after the plain one.
+        Err(e) if host_wave == 32 => {
+            eprintln!("plain lowering on waves of 32: {e:?}; the driver's other forms next");
+            let bytes = crate::dxbc::build(&[]);
+            let c = crate::dxbc::Container::parse(&bytes).unwrap();
+            let st = structure::structure(&p).expect("structure");
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+            let io = io::raise(&p, &native).expect("io::raise");
+            let was = lower::TEST_HOST_WAVE.replace(Some(32));
+            let driven = super::emit(&c, &native, &p, &st, &io, &res);
+            lower::TEST_HOST_WAVE.set(was);
+            match driven {
+                Ok(shader) => shader,
+                Err(e) => {
+                    eprintln!("on waves of 32 the translator refuses this program: {e:?}");
+                    return;
+                }
+            }
+        }
+        Err(e) => panic!("lower: {e:?}"),
+    };
     if let Ok(mut validator) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         validator.validate(&mut shader.dxil.clone()).expect("validate");
     }
     let _lock = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else { eprintln!("no hardware compute device"); return };
     let Ok((root, pipeline)) = host.compute_pipeline(&shader) else {
-        eprintln!("hardware does not take this 64-lane pipeline"); return;
+        eprintln!("hardware does not take this {host_wave}-lane pipeline"); return;
     };
     for (constants, expected) in [
         ([37, 0, 0, 0], [u32::MAX, 31]),
@@ -223,7 +259,7 @@ fn copied_mask_keeps_both_numeric_words_inside_a_lane_branch() {
         }).expect("dispatch and read both words");
         assert_eq!(out[0][..2], expected);
     }
-    eprintln!("four native wave64 low/high word readbacks passed");
+    eprintln!("four low/high word readbacks passed on host waves of {host_wave}");
 }
 
 #[test]

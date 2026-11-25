@@ -314,6 +314,17 @@ pub(crate) fn stands_in(this: This) -> bool {
 pub(crate) static DEPTH_UNORDERED: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Targets in a stand-in format ([`target_format`]), measured to decide
+/// how to make them native on a host without typed unordered access for the
+/// console's 16-bit colour formats (NVIDIA renders to B5G5R5A1 but writes
+/// neither it nor B4G4R4A4 as unordered access): [0] made, [1] of them with
+/// unordered access asked for, [2] shader views and [3] unordered access
+/// views of them made in the title's 16-bit format, copies skipped [4] into
+/// and [5] out of a stand-in, copies converted ([`crate::standin`]) [6] into
+/// and [7] out of one.
+pub(crate) static STAND_IN: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
 /// Whether the title asked for both depth and unordered access for `this`.
 #[cfg(windows)]
 pub(crate) fn depth_and_unordered(this: This) -> bool {
@@ -659,6 +670,11 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// Its format, width, height, depth and row pitch.
+    pub(crate) fn shape(&self) -> (u32, [u32; 4]) {
+        (self.format, [self.width, self.height, self.depth, self.row_pitch])
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
@@ -1890,7 +1906,15 @@ fn host_texture(
     d.format = pc_format(d.format);
     const TARGET: u32 = 1;
     if d.flags & (TARGET | UNORDERED) != 0 {
+        let own = d.format;
         d.format = target_format(d.format);
+        if d.format != own {
+            use std::sync::atomic::Ordering::Relaxed;
+            STAND_IN[0].fetch_add(1, Relaxed);
+            if d.flags & UNORDERED != 0 {
+                STAND_IN[1].fetch_add(1, Relaxed);
+            }
+        }
     }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0

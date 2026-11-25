@@ -832,17 +832,38 @@ extern "system" fn copy_buffer_region(
 
 /// Whether one of two resources is a target in a stand-in format and the
 /// other is not ([`crate::resource::target_format`]): their texels differ
-/// in size, so the host cannot copy between them (logged once).
+/// in size, so the host cannot copy between them directly
+/// ([`crate::standin`] converts). `Some(true)`: the destination stands in.
 #[cfg(windows)]
-fn unlike(dst: This, src: This) -> bool {
-    let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
-    if unlike {
+fn unlike(dst: This, src: This) -> Option<bool> {
+    let into = crate::resource::stands_in(dst);
+    (into != crate::resource::stands_in(src)).then_some(into)
+}
+
+/// Counts a copy [`unlike`] found, converted or skipped (a skip logged
+/// once).
+#[cfg(windows)]
+fn counted(into: bool, converted: bool, dst: This, src: This) {
+    let i = match (converted, into) {
+        (true, true) => 6,
+        (true, false) => 7,
+        (false, true) => 4,
+        (false, false) => 5,
+    };
+    crate::resource::STAND_IN[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !converted {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             tracing::warn!(?dst, ?src, "copy between a stand-in target and title-format texels skipped")
         });
     }
-    unlike
+}
+
+/// A host resource's format.
+#[cfg(windows)]
+fn host_format(r: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u32 {
+    // SAFETY: a live resource.
+    unsafe { r.GetDesc() }.Format.0 as u32
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
@@ -855,7 +876,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if unlike(dst, src) {
+            let differ = unlike(dst, src);
+            if let Some(into) = differ
+                && crate::standin::mode(host_format(from), host_format(to)).is_none()
+            {
+                counted(into, false, dst, src);
                 return;
             }
             // A source the title fills itself is uploaded first (upstream
@@ -871,6 +896,14 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            if let Some(into) = differ {
+                let converted = (0..crate::standin::subresources(to)).all(|sub| {
+                    let source = crate::standin::Source::Texture { texture: from, sub };
+                    crate::standin::convert(list, to, sub, [0; 3], source, None)
+                });
+                counted(into, converted, dst, src);
+                return;
+            }
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
@@ -957,11 +990,22 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
-        if unlike(dst.resource, src.resource) {
-            return;
+        let differ = unlike(dst.resource, src.resource);
+        if let Some(into) = differ {
+            let from_format = if src.kind == FOOTPRINT {
+                src.footprint.shape().0
+            } else {
+                crate::resource::host_resource(src.resource).map_or(0, host_format)
+            };
+            if crate::standin::mode(from_format, host_format(to)).is_none() {
+                counted(into, false, dst.resource, src.resource);
+                return;
+            }
         }
         let mut from = src;
-        let _upload; // keeps the source alive while this call records it
+        // Keeps the source alive while this call records it.
+        let mut upload = None;
+        let mut source_texture = None;
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
@@ -984,7 +1028,7 @@ extern "system" fn copy_texture_region(
                 // SAFETY: a live buffer.
                 read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
             }
-            _upload = buffer;
+            upload = Some(buffer);
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
@@ -995,6 +1039,7 @@ extern "system" fn copy_texture_region(
             }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
+            source_texture = Some(texture);
         }
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
@@ -1025,6 +1070,25 @@ extern "system" fn copy_texture_region(
                 Some(range) => list.note_read(text, range),
                 None => list.note_op(text),
             }
+        }
+        if let Some(into) = differ {
+            // SAFETY: the title's box, or none.
+            let region = (!source_box.is_null()).then(|| unsafe { *source_box });
+            let (source, region) = match (&upload, source_texture) {
+                (Some(buffer), _) => {
+                    let (format, [width, height, depth, pitch]) = src.footprint.shape();
+                    let source = crate::standin::Source::Buffer { buffer, offset: 0, format, pitch, height };
+                    (source, region.or(Some([0, 0, 0, width, height, depth])))
+                }
+                // (a subresource location holds its index where a footprint's offset is)
+                (None, Some(texture)) => {
+                    (crate::standin::Source::Texture { texture, sub: src.footprint.offset as u32 }, region)
+                }
+                (None, None) => return,
+            };
+            let converted = crate::standin::convert(list, to, dst.footprint.offset as u32, [x, y, z], source, region);
+            counted(into, converted, dst.resource, src.resource);
+            return;
         }
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
@@ -1146,7 +1210,10 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        if unlike(dst, src) {
+        // shortcut: a resolve between the layouts is skipped (it averages
+        // samples, which the converting copy does not).
+        if let Some(into) = unlike(dst, src) {
+            counted(into, false, dst, src);
             return;
         }
         // Depth textures shaders also write: what they wrote, first.

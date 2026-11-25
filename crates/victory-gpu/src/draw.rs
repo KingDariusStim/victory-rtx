@@ -1048,7 +1048,8 @@ impl State {
         // Depth planes this list's shaders wrote (the material classes):
         // drawn into their planes by a pass of ours before anything of the
         // title's is set, so what reads them next finds them.
-        if list.planes_now() {
+        // (both asked: each clears what it reports)
+        if list.planes_now() | list.take_ours() {
             self.after_our_pass(list);
         }
         let l = &list.list;
@@ -2778,7 +2779,7 @@ impl State {
                 .unwrap_or(0)
                 + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
-            if n > crate::descriptor::host::DYNAMIC
+            if n > crate::descriptor::host::dynamic_views()
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");

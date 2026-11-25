@@ -614,6 +614,15 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
 /// ([`buffer_view_ok`]), since the start.
 pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// How view heaps are used since the start, to size their two parts on a
+/// host that caps view heaps (NVIDIA: 1,000,000 views, title slots and
+/// dynamic slots sharing them): [0] one past the highest title slot
+/// mirrored, [1] the title slots a host heap holds, [2] the most dynamic
+/// slots taken at once, [3] the dynamic slots a host heap has. Each the
+/// largest over the title's view heaps.
+pub(crate) static VIEW_HEAP_USE: [std::sync::atomic::AtomicU32; 4] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; 4];
+
 /// Whether the host device is gone, and why (the first time it is asked
 /// after that): for passes that make many views, to name the one that did
 /// it.
@@ -726,7 +735,22 @@ pub(crate) fn probe_view_limit() {
             };
             made.is_ok()
         };
-        let views = if fits(UNCAPPED_VIEWS) {
+        // The limit the driver reports, where it does (D3D12 options 19):
+        // a heap past it is not tried, which the debug layer reports as an
+        // error at every start (NVIDIA: 1,000,000).
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: a plain query into our own structure.
+        let reported = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .ok()
+        .map(|()| options.MaxViewDescriptorHeapSize)
+        .filter(|&n| n > 0);
+        let views = if reported.is_none_or(|n| n >= UNCAPPED_VIEWS) && fits(UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
         } else {
             PORTABLE_VIEWS
@@ -751,6 +775,23 @@ pub(crate) fn probe_view_limit() {
 /// for it, and the card stopped within frames). 2^18 leaves 737,000; a
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
+
+/// The dynamic slots of a view heap: [`DYNAMIC`], or
+/// `VICTORY_DYNAMIC_VIEWS=<n>` (2^16 to 2^19). On a capped host heap they
+/// come out of the title's slots, so fewer leave room for more title slots;
+/// [`VIEW_HEAP_USE`] in the periodic report shows the most a run took.
+pub(crate) fn dynamic_views() -> u32 {
+    static VIEWS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VIEWS.get_or_init(|| {
+        let Some(asked) = std::env::var("VICTORY_DYNAMIC_VIEWS").ok().and_then(|v| v.trim().parse::<u32>().ok())
+        else {
+            return DYNAMIC;
+        };
+        let views = asked.clamp(1 << 16, 1 << 19);
+        tracing::info!(views, "dynamic view slots per heap (VICTORY_DYNAMIC_VIEWS)");
+        views
+    })
+}
 const NULL_BLOCK: u32 = 1 << 16;
 
 impl HostHeap {
@@ -773,7 +814,7 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
+        let extra = if sampler { 0 } else { dynamic_views() };
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
@@ -822,6 +863,11 @@ impl HostHeap {
         // The null slot every index past the heap reads is the heap's last,
         // past the dynamic slots (`probe_view_limit`): all of them are free.
         let dynamic = if null == 0 { extra } else { null - count };
+        if !sampler {
+            use std::sync::atomic::Ordering::Relaxed;
+            VIEW_HEAP_USE[1].fetch_max(count, Relaxed);
+            VIEW_HEAP_USE[3].fetch_max(dynamic, Relaxed);
+        }
         let taken = vec![false; extra as usize];
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
@@ -1054,7 +1100,8 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        let free = self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed) - n as u32;
+        VIEW_HEAP_USE[2].fetch_max(taken.len() as u32 - free, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % taken.len()) as u32;
         Some(self.count + first as u32)
     }
@@ -1909,6 +1956,9 @@ impl HostHeap {
         for_draw: bool,
         allow: impl FnOnce(&View, bool) -> bool,
     ) -> Result<Option<View>, ()> {
+        if !self.sampler {
+            VIEW_HEAP_USE[0].fetch_max(index.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+        }
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -2628,6 +2678,8 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
     if view != own && crate::resource::target_format(view) == own {
+        crate::resource::STAND_IN[if unordered { 3 } else { 2 }]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(format) = format {
             *format = d.Format;
         }

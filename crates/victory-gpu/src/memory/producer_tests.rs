@@ -34,7 +34,7 @@ fn a_raw_gpu_write_follows_the_recorded_owner_of_a_reused_page() {
         ByteAddressBuffer directory : register(t0);
         RWByteAddressBuffer pages[2048] : register(u0);
         cbuffer Args : register(b0) { uint page; uint offset; uint marker; };
-        [RootSignature("SRV(t0), DescriptorTable(UAV(u0,numDescriptors=2048)), RootConstants(num32BitConstants=3,b0)")]
+        [RootSignature("SRV(t0), DescriptorTable(UAV(u0,numDescriptors=2048,flags=DESCRIPTORS_VOLATILE)), RootConstants(num32BitConstants=3,b0)")]
         [numthreads(1,1,1)] void main() {
             uint2 entry = directory.Load2(page * 8);
             if (entry.x) pages[entry.x].Store(entry.y + offset, marker);
