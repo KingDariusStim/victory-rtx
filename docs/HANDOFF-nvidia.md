@@ -616,13 +616,47 @@ of milliseconds late (frames repeated or out of order, presents on time).
   refresh_fronts`/`Batch::update`, the copies' refresh, about a third), eight list threads 6-8 s
   each (`draw::State::bind`/`tables`), the relay 5.6 s.
 
-**Ideas not yet tried, in the order I would try them:** (1) refuse the FSR4 network pipeline to
-the title (`VICTORY_REFUSE_PIPELINES=8e614708143ef917`, added, diagnostics) to see whether it
-falls back to a cheaper upscaler, 12 ms; (2) the translator: group doubling for kernels without
-LDS or group sync (two console groups of 32 in one host group of 64: Turing holds 16 groups per
-SM, so 32-thread groups cap occupancy at half); (3) the 25-30 ms of card idle: the chain to each
-submission (`fr5`/`fr7` timelines in the scratchpad); (4) `VICTORY_TEXTURE_BUDGET_MB` against the
-room the copies need, for the textures' sake.
+**Tried after that, 2026-11-26 evening (all with the buffer copies on the card):**
+
+- `VICTORY_REFUSE_PIPELINES=8e614708143ef917` (the FSR4 network, 12 ms): the title asserts on the
+  pipeline result (`fsr4_common.cpp:1721`) and dies. No fallback that way.
+- **The card's idle gaps are one wait, found in the log's "waited for flights, per frame"
+  line.** In the window shot (Lucia's hair filling the frame, the "Move around" prompt: the first
+  gameplay) the submit thread stands **60-80 ms a frame** for one fill of 0x180-0x230 bytes of
+  upload memory out of the title's constant ring, which lies in the 174 MB heap the skinning
+  passes declare written as a whole; the title copies GPU-computed bytes into the ring with a
+  buffer copy at its place in the list just before the draw that reads them. `card_steps`
+  (`VICTORY_CARD_STEPS=2`, in `-Fast`) would do the fill on the card but refuses the submission:
+  "a copy at its place in a list writes what it reads" (the copy and the fill are in one list, so
+  `VICTORY_PLACED_ORDER=1` cannot cut between them); with `VICTORY_COPIES_IN_PLACE=0` "a copy done
+  on the card is read through another host copy"; with `VICTORY_FILL_TITLE=1` the fills go on but
+  the submission then waits "for what a copy at its place writes" (the fill does read the copy's
+  result). A new switch `VICTORY_PLACED_CUT=1` (cut the host list behind a placed copy, so the
+  order path can split the submission) **hangs the title at the loading screen** (run 165640, 11
+  draws a frame for ever; cause not found, left off). The fix that remains is upstream's renderer
+  port 5 (`VICTORY_PORT_CBV=1`, 3920dc2, not transplanted): constant buffers read as raw bytes
+  from the title's memory where it lies on the card, so there is no CPU fill to wait for. Expect
+  the window shot to go from 8.8 to about 13 fps from this alone.
+- `VICTORY_WIDE_THREADS=<n>` added (the copies' refresh helpers; 3 on this 12-thread CPU); not
+  measured yet.
+- **`VICTORY_BVH_BUILDER=1` is what the shading needs.** The title's indirect light, bounce and
+  lamp/sun shadows are ray traced against structures a GPU builder maintains; this fork keeps the
+  builder off (docs/fork-ray-tracing.md) and `VICTORY_AMBIENT=0.8` stands in. Off, rays never hit
+  Lucia: in the window shot her hair is a glowing blonde/orange mass. **On, it is dark brown with
+  a rim light and the wall beside it is lit right** (run 170213, scratchpad `bvh1`). The price
+  here: 5.3-6.4 fps (110-130 ms of GPU a frame, and the fill wait above grows to 113 ms because
+  the fills read buffers the builder stores into), interiors without the ambient stand-in are
+  dark, and the builder's known gaps (overlapping dynamic structures, a dark polygon over Lucia
+  in one shot). With the translator's 20 upstream commits all its stages ran on this card.
+- The three shading complaints, then: hair colour and the ray tracing through the hair are the
+  builder being off (plus whatever its gaps add); the walls losing textures is still open, with
+  the dropped unordered writes to block-compressed title textures as the lead (below).
+
+**What I would do next, in order:** (1) transplant renderer port 5 (`VICTORY_PORT_CBV`) and
+measure the window shot; (2) a per-command timing run with the builder on (started as run
+171x) to see what its stages cost here, then look for the same "system memory" class of loss in
+`memory.rs` (the builder's title memory by address: 1,073 MB in 20 arenas on the card, 122 pages
+a frame "had no copy"); (3) the BC unordered views; (4) group doubling in the translator.
 
 **Shading leads from the logs (the user: Lucia's hair reads blonde/red in the window shot, the
 ray tracing through her hair looks wrong, walls lose textures):**

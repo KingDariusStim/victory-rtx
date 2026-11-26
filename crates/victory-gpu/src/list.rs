@@ -306,7 +306,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
 /// console, never earlier, and nothing can wait for itself that way (a
 /// part has no wait after its first work).
 #[cfg(windows)]
-fn cut(this: This, wait: ValueWait) {
+fn cut(this: This, wait: Option<ValueWait>) {
     if this.is_null() {
         return;
     }
@@ -317,7 +317,7 @@ fn cut(this: This, wait: ValueWait) {
         return;
     };
     if current.untouched() {
-        list.gate.push(wait);
+        list.gate.extend(wait);
         return;
     }
     let Some(fresh) = fresh_list() else {
@@ -325,16 +325,20 @@ fn cut(this: This, wait: ValueWait) {
         // it was recorded in.
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!("no host list for the part after a wait: the wait moves to the part's start"));
-        list.gate.push(wait);
+        list.gate.extend(wait);
         return;
     };
     current.close();
     static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-        tracing::info!(parts = list.earlier.len() + 2, "a list is cut at a wait for a memory value");
+        tracing::info!(
+            parts = list.earlier.len() + 2,
+            at = if wait.is_some() { "a wait for a memory value" } else { "a copy at its place" },
+            "a list is cut"
+        );
     }
     if let Some(done) = list.host.replace(fresh) {
-        let waits = std::mem::replace(&mut list.gate, vec![wait]);
+        let waits = std::mem::replace(&mut list.gate, wait.into_iter().collect());
         list.earlier.push(Part { waits, host: done });
     }
     // What the title set so far, on the new host list.
@@ -842,6 +846,24 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
+/// Cuts the host list behind a copy done at its place in it
+/// (`VICTORY_PLACED_CUT=1`; off by default), so that a step behind the copy
+/// that reads its bytes on the CPU (the fill of a constant buffer out of
+/// the title's ring, which the title copies into just before the draw) is
+/// in a later host list: with `VICTORY_PLACED_ORDER=1` the submission is
+/// then cut there too ([`crate::host::card_steps::cut_for`]) and the fill
+/// is done on the card behind the copy, instead of the submission standing
+/// until the copy's flight has landed (60-80 ms a frame in the diner's
+/// window shot, run 163055: "waited for flights ... for what a copy at its
+/// place writes").
+#[cfg(windows)]
+fn placed_cut(this: This) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_CUT").is_some_and(|v| v == "1")) && crate::queue::cuts() {
+        cut(this, None);
+    }
+}
+
 /// A copy of title memory that `list` records: on the card at its place in
 /// the list ([`crate::host::HostList::place_copy`]), or at submission.
 #[cfg(windows)]
@@ -851,6 +873,7 @@ fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *con
     }
     if list.place_copy(to as usize, from as usize, len) {
         with_state(this, |_, state| state.copied());
+        placed_cut(this);
     } else {
         list.defer_copy(to, from, len);
     }
@@ -1510,6 +1533,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         let len = len as usize;
         if list.place_copy(dst as usize, src as usize, len) {
             with_state(this, |_, state| state.copied());
+            placed_cut(this);
             return;
         }
         list.defer(move || {
@@ -2180,7 +2204,7 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
     // The list is cut here, and the wait stands before what follows.
     #[cfg(windows)]
     if crate::queue::cuts() {
-        cut(this, wait);
+        cut(this, Some(wait));
         return;
     }
     VALUE_WAITS
