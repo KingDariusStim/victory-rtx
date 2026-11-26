@@ -349,6 +349,10 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// Of the stage being bound: where each constant buffer view of its
+    /// tables is in the host's heap, by (root parameter, entry's dword):
+    /// what `USER_CBV_INDEX` words read (`victory_shader::emit`).
+    cbv_slots: Vec<(u8, u32, u32)>,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
@@ -1237,6 +1241,21 @@ impl State {
                 _ => 0,
             };
         }
+        if kind == victory_shader::emit::USER_CBV_INDEX {
+            // Made by `tables` for this stage just before.
+            return match self.cbv_slots.iter().find(|c| c.0 == slot && c.1 == dword) {
+                Some(&(_, _, index)) => index,
+                None => {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::CbvMissing, 1);
+                    once!(slot, dword, "a shader reads a table's constant buffer view the host made no slot for");
+                    0
+                }
+            };
+        }
+        if kind == victory_shader::emit::USER_TABLE_WHOLE {
+            return 0;
+        }
         if kind != USER_VIEW_ADDRESS && kind != USER_VIEW_ADDRESS + 1 {
             once!(kind, "a shader reads a host value this build does not know");
             return 0;
@@ -1500,7 +1519,7 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, &t.host.user_data, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -2798,6 +2817,12 @@ impl State {
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
                 let v = match u.root {
+                    // (Of the last stage bound only: no warning here.)
+                    RootType::Other(victory_shader::emit::USER_CBV_INDEX) => self
+                        .cbv_slots
+                        .iter()
+                        .find(|c| c.0 == u.slot && c.1 == u.dword)
+                        .map_or(0, |c| c.2),
                     RootType::Other(kind) => self.host_word(compute, kind, u.slot, u.dword, None),
                     _ => self.user_value(compute, u.slot, u.root, u.dword),
                 };
@@ -3157,8 +3182,11 @@ impl State {
         list: &HostList,
         used: &[UsedResource],
         indexed: &[RootIndexedView],
+        user: &[victory_shader::emit::UserData],
         compute: bool,
     ) -> Few<(u8, u32), 16> {
+        use victory_shader::emit::{USER_CBV_INDEX, USER_TABLE_WHOLE};
+        self.cbv_slots.clear();
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Few<u8, 16> = Few::default();
         for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
@@ -3168,6 +3196,30 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         let cbv: Vec<u8> = fresh.to_vec();
+        // Tables whose constant buffer views the program reads at heap
+        // indices the host gives (`USER_CBV_INDEX`), and none other way
+        // (`USER_TABLE_WHOLE`): split. Each view gets a slot of its own,
+        // holding what it read at the draw; the rest of the table stays on
+        // the title's slots, as a table without one does. Run 27: tables
+        // made again whole for their constant buffers were 198,000 slots a
+        // frame, of 262,144, mostly holes. (Not a table reaching past the
+        // title slots the host mirrors: those have no slots of the title's.)
+        let mut split: Few<u8, 16> = Few::default();
+        if crate::toggled!("VICTORY_CBV_SPLIT") {
+            let asks = |kind: u32, slot: u8| user.iter().any(|u| u.root == RootType::Other(kind) && u.slot == slot);
+            for &slot in fresh.iter() {
+                if asks(USER_CBV_INDEX, slot) && !asks(USER_TABLE_WHOLE, slot) && !self.past_mirror(used, slot, compute) {
+                    split.push(slot);
+                }
+            }
+        }
+        if !split.is_empty() {
+            let mut whole: Few<u8, 16> = Few::default();
+            for &slot in fresh.iter().filter(|s| !split.contains(s)) {
+                whole.push(slot);
+            }
+            fresh = whole;
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -3190,12 +3242,21 @@ impl State {
             }
         }
         fresh.sort_unstable();
-        for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
-            }
-        }
         let mut made = Few::default();
+        for u in used.iter().filter(tables) {
+            if fresh.contains(&u.slot) {
+                continue;
+            }
+            if u.kind == ResourceType::Cbv && split.contains(&u.slot) {
+                match self.cbv_slot(list, u, compute) {
+                    Some(index) => self.cbv_slots.push((u.slot, u.table_offset_dwords, index)),
+                    // No room: the draw must not run (`bind` drops it).
+                    None => made.push((u.slot, u32::MAX)),
+                }
+                continue;
+            }
+            self.table_entry(list, u, compute);
+        }
         for &slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -3486,7 +3547,76 @@ impl State {
             }
             made.push((slot, first * 32));
         }
+        // Constant buffer views of tables made whole: in the table's slots.
+        for &(slot, offset) in made.iter() {
+            if offset == u32::MAX {
+                continue;
+            }
+            for u in used.iter().filter(tables).filter(|u| u.slot == slot && u.kind == ResourceType::Cbv) {
+                self.cbv_slots.push((slot, u.table_offset_dwords, offset / 32 + u.table_offset_dwords / 8));
+            }
+        }
         made
+    }
+
+    /// Whether an entry of the table in root parameter `slot` lies past the
+    /// title slots the host heap mirrors (or its heap is not known): such a
+    /// table is made whole.
+    fn past_mirror(&self, used: &[UsedResource], slot: u8, compute: bool) -> bool {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return true;
+        };
+        let Some(heap) = self.heap_of(table) else {
+            return true;
+        };
+        let Some(host) = heap.host() else {
+            return true;
+        };
+        if heap.samplers() || (table - heap.start) % 32 != 0 {
+            return true;
+        }
+        used.iter().filter(|u| u.root == RootType::Table && u.slot == slot).any(|u| {
+            heap.index(table + u64::from(u.table_offset_dwords) * 4).is_none_or(|index| index >= host.count())
+        })
+    }
+
+    /// A slot of the host's own for the constant buffer view `u` of a
+    /// split table: what the view reads copied to upload memory when the
+    /// list is submitted (as a table made whole does it). The same view
+    /// holding the same record is made once in a list. `None` without room.
+    fn cbv_slot(&mut self, list: &HostList, u: &UsedResource, compute: bool) -> Option<u32> {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+            return None;
+        };
+        let handle = table + u64::from(u.table_offset_dwords) * 4;
+        let heap = self.heap_of(handle)?;
+        let host = heap.host()?;
+        let key = {
+            let mut h = RecordHash::default();
+            // SAFETY: a descriptor slot in title memory.
+            h.add(unsafe { (handle as *const [u32; 3]).read_unaligned() });
+            (handle, 1, h.0)
+        };
+        if let Some(known) = self.fresh_tables.get(&key) {
+            return Some(known.first);
+        }
+        let index = host.dynamic(1)?;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::CbvSplitSlots, 1);
+        self.fresh_tables.insert(key, FreshTable { first: index, epoch: 0, ready: Vec::new() });
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, index, 1));
+        match crate::descriptor::view(handle) {
+            Some(View::Constant(address, size)) => match list.scratch_held(u64::from(size)) {
+                Some((buffer, gpu, to)) => {
+                    list.defer_constants(to, address as *const u8, size as usize, (std::ptr::from_ref(heap) as usize, index));
+                    host.constant_at(index, &buffer, gpu, size);
+                }
+                None => host.make_null(index),
+            },
+            Some(view) => host.make_at(index, &view),
+            None => host.make_null(index),
+        }
+        Some(index)
     }
 
     /// The first draws, at debug level: what they bind and read

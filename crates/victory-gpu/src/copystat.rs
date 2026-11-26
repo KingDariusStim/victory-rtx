@@ -70,6 +70,10 @@ pub(crate) enum C {
     /// Long tables placed by the offsets they read: asked, refused.
     SparseAsked,
     SparseRefused,
+    /// Constant buffer views of split tables given a slot of their own.
+    CbvSplitSlots,
+    /// `USER_CBV_INDEX` words asked at a bind with no slot made (read 0).
+    CbvMissing,
     /// Marker texts for device-removed data (`HostList::note`).
     NoteNs,
     /// Ranges given to shaders (steps), their snapshots, and the bytes
@@ -1248,6 +1252,11 @@ pub(crate) fn log(frames: f64) {
         "sparse tables per frame (VICTORY_SPARSE_TABLES): {:.0} placed by the offsets they read, {:.0} found no place (made whole instead)",
         c[C::SparseAsked as usize] - c[C::SparseRefused as usize],
         c[C::SparseRefused as usize],
+    );
+    tracing::info!(
+        "constant buffer views of split tables per frame (VICTORY_CBV_SPLIT): {:.0} slots of their own made; {:.1} asked for with none made",
+        c[C::CbvSplitSlots as usize],
+        c[C::CbvMissing as usize],
     );
     if let Some((free, stretches, longest, (sparse_free, sparse))) = crate::descriptor::with_view_heap(|heap| heap.dynamic_census()) {
         tracing::info!(

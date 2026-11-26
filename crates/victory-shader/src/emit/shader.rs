@@ -94,6 +94,20 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host computes: the heap
+/// index of the constant buffer view at dword `dword` (an entry's first) of
+/// the descriptor table of root parameter `slot`, in a slot of the host's own
+/// that holds what the view read when the draw was recorded. A constant
+/// buffer read at a fixed offset of a table reads it there, not at the
+/// table's start plus the offset: the host need not make the whole table
+/// again for its constant buffers (on NVIDIA the per-draw slots ran out with
+/// tables of 100-250 slots made again for one or two).
+pub const USER_CBV_INDEX: u32 = 0x107;
+/// `RootType::Other` code of a user-data dword the host does not use, asked
+/// for table `slot` when the program reads one of that table's constant
+/// buffer views some other way ([`USER_CBV_INDEX`] could not be used): the
+/// host then makes the whole table again, as before.
+pub const USER_TABLE_WHOLE: u32 = 0x108;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

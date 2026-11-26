@@ -7176,7 +7176,13 @@ impl<'a> Lower<'a> {
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
-                let index = self.heap_index(*load, *first, sampler)?;
+                let index = match self.cbv_index(*load, *first, sampler, props) {
+                    Some(index) => index,
+                    None => {
+                        self.note_whole_table(src);
+                        self.heap_index(*load, *first, sampler)?
+                    }
+                };
                 let (index, bounded) = self.raw_twin(src, index, sampler, props);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
@@ -7229,6 +7235,7 @@ impl<'a> Lower<'a> {
             }
             Source::Phi { block, args } => {
                 let _ = site;
+                self.note_whole_table(src);
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
                 let (index, bounded) = self.raw_twin(src, phi, sampler, props);
                 Ok(self.s.heap_handle_at(self.cur, index, sampler, false, props, bounded))
@@ -7242,6 +7249,7 @@ impl<'a> Lower<'a> {
                 else {
                     return Err("a descriptor chosen by a condition");
                 };
+                self.note_whole_table(src);
                 let cond = match self.get(*scc)? {
                     Val::Bit(x) => x,
                     _ => return Err("SCC without a value"),
@@ -7256,10 +7264,70 @@ impl<'a> Lower<'a> {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
+                self.note_whole_table(src);
                 let index = self.lane_heap_index(src, sampler)?;
                 let (index, bounded) = self.raw_twin(src, index, sampler, props);
                 Ok(self.s.heap_handle_at(self.cur, index, sampler, true, props, bounded))
             }
+        }
+    }
+
+    /// The heap index of a constant buffer view read at a fixed offset of a
+    /// table, as the host gives it ([`super::shader::USER_CBV_INDEX`]): a slot
+    /// of its own holding what the view read at the draw. `None` for
+    /// anything else: a sampler, a read of another kind, an offset computed
+    /// in the code, an entry the program does not list as a constant buffer
+    /// or that does not begin a heap slot.
+    fn cbv_index(&mut self, load: Site, first: u8, sampler: bool, props: (u32, u32)) -> Option<V> {
+        const CONSTANT: u32 = 13;
+        if sampler || props.0 & 0xFF != CONSTANT {
+            return None;
+        }
+        let a = *self.scalar.get(&load)?;
+        if a.dynamic.is_some() {
+            return None;
+        }
+        let rp = *self.x.native.layout.get(a.param)?;
+        if rp.root != RootType::Table {
+            return None;
+        }
+        let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
+        let Fields::Smem { soffset, .. } = &li.fields else {
+            return None;
+        };
+        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+            return None;
+        }
+        let dword = a.offset / 4 + u32::from(first);
+        let entry = dword / 8 * 8;
+        let listed = self.x.native.used.iter().any(|u| {
+            u.root == RootType::Table
+                && u.user_data == rp.user_data
+                && u.kind == ResourceType::Cbv
+                && u.table_offset_dwords == entry
+        });
+        listed.then(|| self.host_word(RootType::Other(super::shader::USER_CBV_INDEX), rp.slot, entry))
+    }
+
+    /// Tells the host that the program reads a constant buffer view of a
+    /// table at the table's start plus its offset, for each table `src`
+    /// may read one of that way ([`super::shader::USER_TABLE_WHOLE`]): the
+    /// host makes such a table whole again.
+    fn note_whole_table(&mut self, src: &Source) {
+        let mut slots = Vec::new();
+        for leaf in src.leaves() {
+            let (Source::Loaded { load, .. } | Source::Fetched { load, .. }) = leaf else {
+                continue;
+            };
+            let Some(rp) = self.scalar.get(load).and_then(|a| self.x.native.layout.get(a.param)) else {
+                continue;
+            };
+            if rp.root == RootType::Table && self.used_kind(leaf).is_some_and(|u| u.kind == ResourceType::Cbv) {
+                slots.push(rp.slot);
+            }
+        }
+        for slot in slots {
+            let _ = self.host_word(RootType::Other(super::shader::USER_TABLE_WHOLE), slot, 0);
         }
     }
 
