@@ -4,6 +4,9 @@ Where the NVIDIA effort stands, what was measured, what is broken, what to do ne
 quirks that cost time. Written for whoever picks this up next, human or agent. Everything here
 was measured on one PC; numbers from other machines are labelled.
 
+**Start here (2026-11-26):** "Next, in this order" below: first the intro stutter after the first
+A press, then mouths that move with the spoken lines in cutscenes.
+
 ## The machine
 
 | | |
@@ -387,6 +390,83 @@ and from 5315 on a blur with hard bands that thickens frame by frame and does no
 "0/20 vision". The first is what a tiled pass leaves when some of its tiles' draws are refused;
 the second a temporal pass feeding on its own output after a bad input. The cell's frames before
 it (1200 frames into the world) are sharp.
+
+## Next, in this order (from the user, 2026-11-26, after run 40)
+
+Run 40 (`victory-data/logs/run-20261126-110925.log`, the tree at 9cb2adc, Series S profile, the
+pipeline book warm) is the baseline for both targets.
+
+### Target 1: the stutter in the intro animation, about 10 s after A is first pressed
+
+What the user sees: right after the first A press the intro animation stutters for about ten
+seconds, then runs smoothly. What run 40 shows so far:
+
+- The 5-second frame meter (`victory_gpu::host: N fps`) reads a flat 30.0 fps from 15:09:41 to
+  15:10:11, so the meter's averages hide it. **First step: a per-frame measure.** Log each
+  present's interval and, every second, the longest interval and how many intervals were over
+  40 ms. Then find the A press in time: log it in `victory_hle::modules::gameinput` (a button
+  going down), because nothing marks it now.
+- **The main suspect is pipeline creation in play.** The book is warm, yet run 40 made 40-126 host
+  pipelines a second from 15:09:31 to 15:09:49, and again 30-83 a second from 15:09:55 to
+  15:10:00.
+  - Count the `host pipeline shaders=` lines per second (an awk over the timestamps does it).
+  - `pipeline::make` waits up to 500 ms a frame for a pipeline (`host pipeline wait budget per
+    frame millis=500`). A pipeline that is new to the driver, or loaded from the library on the
+    submitting thread, is a hitch.
+  - Check whether these pipelines are library loads (`pipeline/host.rs`, `library::pipeline`:
+    `LoadGraphicsPipeline` before `Create…`) or real creations. If they are real, the book misses
+    them: compare their names with the book, and check whether `-Mode warm` builds the 2D intro's
+    pipelines at all.
+  - Fixes to try, in order:
+    - build them ahead from the book at start;
+    - make them on worker threads and skip the draw until they are ready (no wait), as the run's
+      `VICTORY_SKIP_PIPELINES` switch hints;
+    - lower the wait budget for 2D-only frames.
+- **Shader translations in play**: 50-120 `shader translated` lines a second, even where no
+  pipeline is made (15:10:01-15:10:16). `Shader::translated()` (`pipeline.rs`) runs on first use,
+  and a translation that misses the disk cache costs milliseconds on the thread that needs it.
+  Count hits against misses, and translate the book's shaders ahead.
+- Other suspects, for after that:
+  - textures uploaded in the intro (12.7 MB a frame from 15:09:46 to 15:09:56: probably the intro
+    movie's frames);
+  - the no-vsync present: `Present(0, 0)` on a 59 Hz display, `host.rs` around line 9208, open
+    problem 7. That one makes a regular one-refresh hitch about once a second, not a ten-second
+    burst. Add the vsync switch anyway: `VICTORY_VSYNC=1` → `Present(1, 0)`.
+- Done when: the per-frame log shows no interval over 50 ms in the 15 s after the A press, and
+  the user confirms by eye.
+
+### Target 2: mouths that move with the spoken lines in cutscenes
+
+What the user sees: in cutscenes the dialogue plays, but the characters' mouths do not move. No
+run has looked at this yet. Candidates, roughly from most to least likely:
+
+1. **Facial animation computed on the card and dropped.** Seven compute pipelines are refused in
+   run 40: the six listed in open problem 6 (they need waves of 64; Turing has only 32), and a new
+   one, `6b82bc7d22016cb5`. Each is dropped once or so a frame. If one of them is the face's blend
+   shapes, its skinning or its bone palette, the face holds its rest pose.
+   - Find which passes they belong to: capture a cutscene frame with
+     `VICTORY_CAPTURE_WORLD=1` and the shaders with `VICTORY_SHADER_SAVE`, then read what each
+     one writes.
+   - Then split them for wave 32 in `victory-shader`, as the translator already does for most
+     wave-64 programs.
+   - A quick test first: do the mouths move on avatarmanz's 7900 XTX, which runs wave 64
+     natively? If they do, this is the cause.
+2. **Lip sync driven by the audio's clock.** These titles usually drive visemes from the dialogue
+   stream's playback position, or from lip-sync data loaded with the stream.
+   - Dialogue arrives minutes late on a first run (streaming; see "Quirks"). A line that starts
+     before its lip-sync data is in may play with a still face.
+   - The position the HLE reports for a voice may not advance: `victory_hle::modules::apu`, `dsp`
+     and `audio` (the coprocessor commands, and the position or "samples played" a stream reports
+     back).
+   - Test: log the reported position of the dialogue stream through one spoken line, and check
+     whether it moves smoothly and ends at the stream's length.
+3. **Dropped draws of the face itself**: a separate face mesh or a decal pass. Run 4 had the face
+   missing outright. Since the view-slot fix, 0.02% of tables are still refused; check that none
+   of them are a face draw in a cutscene, using the capture listing.
+
+How to get there quickly: the first cutscene with dialogue (the prison yard into the diner
+flashback). Use `Drive-Run.ps1 -EnterAfter` to skip the menus, and capture a few hundred frames
+in which a line is spoken. Done when: the mouths move in time with the lines in that cutscene.
 
 ## How to run
 
