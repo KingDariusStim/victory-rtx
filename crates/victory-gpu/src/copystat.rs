@@ -808,6 +808,13 @@ fn log_memory() {
         targets[8],
         mb(targets[9]),
     );
+    // Which they are, by shape, with every sixth line.
+    static SHAPES: AtomicU64 = AtomicU64::new(0);
+    if SHAPES.fetch_add(1, Relaxed) % 6 == 2 {
+        let shapes = crate::resource::targets_by_shape(14);
+        let text: Vec<String> = shapes.iter().map(|(what, count, bytes)| format!("{count} x {what} {:.0} MB", mb(*bytes))).collect();
+        tracing::info!("host copies the host renders to or writes, the biggest groups: {}", text.join("; "));
+    }
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \

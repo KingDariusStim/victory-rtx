@@ -1282,12 +1282,49 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// `VICTORY_TEXTURE_MAX=<pixels>` (unset: no cap): a 2D texture the title
+/// fills whose sides exceed it is hosted from the first level that fits, as
+/// if every view began there ([`capped_first`]). For cards whose memory the
+/// title's textures overrun: on this 8 GB card the queue of textures picked
+/// by index stopped at the budget with 31,600 waiting, and floors, hair and
+/// faces showed the neutral texture (run 5). Belobug's tree caps streamed
+/// textures at 1024 on a 16 GB card for the same reason.
+#[cfg(windows)]
+pub(crate) fn texture_max() -> Option<u32> {
+    static MAX: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        let max = std::env::var("VICTORY_TEXTURE_MAX").ok()?.trim().parse::<u32>().ok().filter(|&m| m >= 64)?;
+        tracing::info!(max, "textures the title fills are hosted from the first level of at most that many pixels a side (VICTORY_TEXTURE_MAX)");
+        Some(max)
+    })
+}
+
+/// The first level at or after `first` whose sides fit [`texture_max`]
+/// (`first` without a cap, or for what the cap does not apply to).
+#[cfg(windows)]
+fn capped_first(desc: &ResourceDesc, first: u32) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    let Some(max) = texture_max() else {
+        return first;
+    };
+    if !fills(desc) || desc.dimension != TEXTURE_2D || desc.depth_or_array_size != 1 || desc.mip_levels <= 1 || desc.sample_count > 1 {
+        return first;
+    }
+    let max = u64::from(max);
+    let mut n = first;
+    while n + 1 < u32::from(desc.mip_levels) && (desc.width >> n > max || u64::from(desc.height) >> n > max) {
+        n += 1;
+    }
+    n
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
 /// host can have as a texture's level 0 ([`read_from`]; block-compressed
 /// formats in whole blocks).
 #[cfg(windows)]
 fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     const TEXTURE_2D: u32 = 3;
+    let first = capped_first(desc, first);
     if first == 0
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
@@ -1318,6 +1355,11 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
 #[cfg(windows)]
 pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
+    let first = match texture_max() {
+        // SAFETY: 56 bytes in the description's layout.
+        Some(_) => capped_first(&unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() }, first),
+        None => first,
+    };
     if first == 0 || !held_only() {
         return placed_bytes(desc);
     }
@@ -2270,6 +2312,45 @@ pub(crate) fn census() -> [u64; 10] {
         }
     }
     count
+}
+
+/// Diagnostics: the host copies the host renders to or writes (not the
+/// ones the title fills), grouped by width, height, format and flags: for
+/// each of the `most` groups holding the most bytes, a description, how
+/// many, and their bytes (twins counted with their textures). On this 8 GB
+/// card they were 3 GB of 730 textures at the end of run 16, against 1.7
+/// GB of textures the title fills, and the card 950 MB over its budget.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn targets_by_shape(most: usize) -> Vec<(String, u64, u64)> {
+    let mut groups: std::collections::HashMap<(u64, u32, u16, u32, u32, u16), (u64, u64)> = std::collections::HashMap::new();
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: as in `let_go_idle`.
+        let r = unsafe { &*(at as *const Resource) };
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((host, twin)) = made.as_ref() else {
+            continue;
+        };
+        if host.filled {
+            continue;
+        }
+        let d = &r.desc;
+        let key = (d.width, d.height, d.depth_or_array_size, d.format, d.flags, d.mip_levels);
+        let e = groups.entry(key).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
+    }
+    let mut out: Vec<(String, u64, u64)> = groups
+        .into_iter()
+        .map(|((w, h, slices, format, flags, mips), (count, bytes))| {
+            let shape = if slices > 1 { format!("{w}x{h}x{slices}") } else { format!("{w}x{h}") };
+            let mips = if mips > 1 { format!(" {mips} levels") } else { String::new() };
+            (format!("{shape} f{format} flags {flags:#x}{mips}"), count, bytes)
+        })
+        .collect();
+    out.sort_by_key(|g| std::cmp::Reverse(g.2));
+    out.truncate(most);
+    out
 }
 
 /// Host textures alive (the title's and the twins) and the bytes the host

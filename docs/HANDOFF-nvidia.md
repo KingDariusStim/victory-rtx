@@ -193,7 +193,31 @@ then the right landing for it. Phase 2 (the 94 MB card copy, fetched at the touc
 that refactor for the same reason: it is the most overlapped memory of all.
 
 Run 6 also showed ~700 draws a frame dropped "without a host pipeline" against run 5's 5: new scene
-content, not a regression; `-Mode warm` after a run covers it. Runs 7-16 were driven unattended (a
+content, not a regression; `-Mode warm` after a run covers it.
+
+## What fills the 8 GB (run 16, the prison yard, after 10 minutes)
+
+The memory line (`memory of textures`, diagnostics builds, every 10 s): the card's budget is 7,219 MB
+and **8,167 MB were in use**, 950 MB over, with 7.5 GB of the PC's memory shared with the card in use
+(Windows paging). Of it: host copies the host renders to or writes, 730 alive, **3,045 MB**; host
+copies of textures the title fills, 17,774 alive, 1,729 MB (36,611 let go and 1,388 made again since
+the start: the sweep works); card copies of title buffers 572 MB; 1,642 texture passes made nothing
+for lack of room. So the textures the title fills, which problem 1 above is about, are not the main
+consumer; the host-rendered targets are, at 1440p what the console draws at. Two tools for it, both
+in this tree now:
+
+- `VICTORY_TEXTURE_MAX=<pixels>`: a 2D texture the title fills whose sides exceed it is hosted from
+  the first mip level that fits (`resource.rs` `texture_max`, `capped_first`; it rides on the
+  held-levels machinery, `VICTORY_HELD_LEVELS`). Belobug's tree caps streamed textures at 1024 on a
+  16 GB card for the same reason. Run 18 tried 1024 here: 40 s after the first world frame the
+  copies the title fills were 2,344 MB against run 16's 2,386 at the same point, the card 7,394 MB
+  against 7,653. Not a lever: the title streams its own mip levels and views most textures from
+  small ones already (36,000 copies "of the levels viewed alone", 922 MB on the card, against
+  16.5 GB had they been whole), so what is left to cap is little. Kept as a switch.
+- The memory line now lists, with every sixth one, the host-rendered copies by shape
+  (`targets_by_shape`): the fourteen groups holding the most bytes, as count, width x height,
+  format, flags, levels and MB. That is where to look for aliased or transient targets the host
+  keeps a copy of each. Runs 7-16 were driven unattended (a
 PowerShell driver pressed Enter with a held key, took screenshots and logged the frame rate; a
 `SendKeys` press is too short for the title to see).
 
