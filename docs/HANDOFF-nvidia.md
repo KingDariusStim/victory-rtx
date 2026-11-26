@@ -533,6 +533,29 @@ the characters' mouths do not move. Candidates as first listed, from most to lea
    missing outright. Since the view-slot fix, 0.02% of tables are still refused; check that none
    of them are a face draw in a cutscene, using the capture listing.
 
+### Target 3: occasional triangle glitches (added by the user on 2026-11-26)
+
+Not seen yet by this session: 143 screenshots a second apart in the prison cell after the first
+cutscene showed none, but the scripted keys (`VICTORY_KEYS=140-170:W,...`) hardly moved the
+character there, so that scan covers one static view. Ask the user where and when they appear.
+
+The lead: two of the refused wave-64 programs are the VFX triangle heap,
+`vfx_triangleClip:CS_CollectTriangles_Meshlets` (6b82bc7d22016cb5) and
+`CS_DefragHeap_ComputeRelocations` (02384a60fda6f2d0). The rest of that family runs every frame
+(`CS_DefragHeap_ProcessFreeRequests`, `_PostAllocateValidation`, `CS_RelocateVfxStartIndexLocation`
+as an indirect dispatch, `CS_ClearDecal`): a heap that is defragmented without its relocations
+computed, and never fed new triangles, is a plausible source of stray triangles when a decal or
+VFX is spawned. Both need "LDS in a group over 32, an LDS read and write in one lane-branch
+region" (`VICTORY_WAVE_WHY=1`), and every retry form keeps 64 lanes.
+
+Upstream `avatarmanz/VIctory-7900XTX` main (c9c932c, 133 commits past our merge base, checked out
+in `victory_repo/victory-upstream`, built) translates one of the seven refused programs so that
+this card accepts the pipeline, `sr_tracing:CS_Tiling_Generate_Opaque` (2cc4c197ee29e291); the
+other six, these two among them, are still refused there (`translate --pipelines`). The three
+untranslatable ones fail there too. So the fix is translator work of our own, or, cheaper,
+skipping the whole triangle-heap family together so its consumers see an empty heap rather than a
+half-maintained one, if the glitches turn out to be theirs.
+
 How to get there quickly: the first cutscene with dialogue (the prison yard into the diner
 flashback). Use `Drive-Run.ps1 -EnterAfter` to skip the menus, and capture a few hundred frames
 in which a line is spoken. Done when: the mouths move in time with the lines in that cutscene.
