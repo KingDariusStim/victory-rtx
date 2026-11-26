@@ -1427,6 +1427,13 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // A compute pass of ours (`crate::standin`, root views only) set its
+        // own root signature and pipeline: the title's go back, as after the
+        // ambient stand-in. Nothing else of the title's is touched by it.
+        if list.take_ours() {
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+        }
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);

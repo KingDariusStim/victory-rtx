@@ -3789,6 +3789,8 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
     if view != own && crate::resource::target_format(view) == own {
+        crate::resource::STAND_IN[if unordered { 3 } else { 2 }]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(format) = format {
             *format = d.Format;
         }

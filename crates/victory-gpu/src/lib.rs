@@ -71,6 +71,8 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+mod standin;
+#[cfg(windows)]
 mod tiles;
 pub mod signature;
 mod switch;

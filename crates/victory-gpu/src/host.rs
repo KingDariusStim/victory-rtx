@@ -1172,6 +1172,9 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Whether a pass of ours set a root signature and pipeline of its own
+    /// since the last draw or dispatch ([`HostList::ours_recorded`]).
+    ours: std::sync::atomic::AtomicBool,
     /// Scratch buffers of the batched clamps (`crate::indirect::batch`), and
     /// how many batches of this recording have a place in them.
     batch_args: Mutex<(Vec<ID3D12Resource>, u32)>,
@@ -4048,6 +4051,7 @@ impl Host {
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                ours: std::sync::atomic::AtomicBool::new(false),
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
@@ -7085,6 +7089,18 @@ impl HostList {
         self.deferred().indirect_readable = scratch.as_raw() as usize;
     }
 
+    /// A pass of ours (a compute pass, `crate::standin`) set its own root
+    /// signature and pipeline in this list: the next draw or dispatch
+    /// sets the title's again (`State::bind`).
+    pub(crate) fn ours_recorded(&self) {
+        self.ours.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a pass of ours was recorded since this was last asked.
+    pub(crate) fn take_ours(&self) -> bool {
+        self.ours.swap(false, Ordering::Relaxed)
+    }
+
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
@@ -8742,9 +8758,25 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            let stand_in = crate::resource::STAND_IN.each_ref().map(|c| c.load(Ordering::Relaxed));
+            if stand_in[0] > 0 {
+                tracing::info!(
+                    "16-bit colour targets in 8-bit RGBA stand-ins: {} made ({} with unordered access asked), \
+                     views in the 16-bit format: {} shader, {} unordered; copies converted: {} into a stand-in, \
+                     {} out of one; skipped: {} into, {} out of",
+                    stand_in[0],
+                    stand_in[1],
+                    stand_in[2],
+                    stand_in[3],
+                    stand_in[6],
+                    stand_in[7],
+                    stand_in[4],
+                    stand_in[5]
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
-                let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                let put =[0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
                 tracing::info!(
                     "what shaders wrote put into title memory per frame (VICTORY_EXACT_BACK): {:.0} pieces in {:.0} writes, {:.1} MB; {:.0} pieces joined over gaps",
                     put[0],
