@@ -726,3 +726,22 @@ For an 8 GB card (settings.local.ps1 `$Defaults`, this PC): `VICTORY_CARD_ROOM_F
   trailer; each port names its source commit and author. Keep that.
 - **No game material in the repository**, ever (`docs/asset-policy.md`); local paths go in the
   git-ignored `tools/runkit/settings.local.ps1`.
+
+### Port 5 without twins, and the blue screen (2026-11-26, 19:18)
+
+Upstream's port 5 reads a table's constant buffer through the raw twin of its slot; twins need
+view heaps of 2^22 views and NVIDIA takes a million, so on this card the port fell back to copying
+("not on 16 bytes", 6,000-6,700 a frame) and nothing changed. Commit 7eb5dc7 adds the no-twin
+form (the slot itself a raw view, `constants_raw_in_slot`) and `VICTORY_PORT_CBV_COPY` (a table's
+constant buffer in a copy read out of the copy, its range refreshed). Run 191409 with
+`VICTORY_PORT_CBV=1`: the fill wait is gone (0.5-3.5 ms a frame, 9,106 constant buffers a frame
+out of copies), **but the picture is all white** (constants read wrong: a null or misaligned raw
+view, or a shader path that still reads the slot as a constant buffer), 2.5-3.5 fps with the
+`victory-pipelines-N` threads building pipelines in play despite the warm, and four minutes in
+the machine blue-screened: bugcheck 0x1A MEMORY_MANAGEMENT (0x41792, a corrupted page table
+entry; minidump `C:\Windows\Minidump\112626-6828-01.dmp`). The runtime was at 25 GB private with
+563 MB of RAM free and 1.2 GB of commit left (32 GB RAM, a 5 GB system-managed pagefile). The
+layer has no path to a shutdown API; the crash is the kernel or a driver (the card reads 4 GB of
+host copies in system memory) under that pressure, or RAM. Do not run `VICTORY_PORT_CBV=1` again
+until the white picture is understood (a capture of one draw's descriptors would do it), and keep
+commit headroom: a larger pagefile. The reboot at 17:33 the same day was Windows Update.
