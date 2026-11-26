@@ -13,7 +13,16 @@
 >   the periodic report; `VICTORY_DYNAMIC_VIEWS`; the heap-size probe asks D3D12 first;
 > - audio-decoder counters and failure logging (`crates/victory-hle/src/modules/apu.rs`);
 > - tests: a 32-lane variant of a wave64 test, a race fixed in an in-place memory test;
-> - a Windows run kit with a log summarizer (`tools/runkit`).
+> - a Windows run kit with a log summarizer (`tools/runkit`);
+> - a stand-in ambient light after the title's indirect-light resolve, so shadowed areas are
+>   not pitch black without ray tracing (`crates/victory-gpu/src/ambient.rs`), ported from the
+>   idea and shader of [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD);
+> - from [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) (each commit
+>   names the original): pipelines and render targets a list binds again are not set again
+>   (after Belobug 92d353f8 by romainhedouin and ZJOU-VICTORY acf478b8), shader-written ranges
+>   declared once and unaligned root constants filled once per list (after Belobug dd799aad and
+>   84ea9c12 by romainhedouin), and instruction fixes (64-bit literals, exact normalized ends,
+>   FLAT offsets).
 >
 > **No game content.** This repository contains no game files, code or assets, and none are
 > distributed: you need your own legally obtained copy, and everything is derived from it on your
