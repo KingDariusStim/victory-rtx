@@ -469,8 +469,45 @@ the intro animation stutters for about ten seconds, then runs smoothly. What run
 
 ### Target 2: mouths that move with the spoken lines in cutscenes
 
-What the user sees: in cutscenes the dialogue plays, but the characters' mouths do not move. No
-run has looked at this yet. Candidates, roughly from most to least likely:
+**Looked at on 2026-11-26 (runs 51-62), not fixed. What is known now:**
+
+- **Ruled out: the refused and untranslated compute programs.** They are named (`victory translate
+  shaders.rpf --list` with `VICTORY_TRANSLATE_ONLY=<hashes>` prints the pack's record names):
+  `alphaResolve:CS_AlphTransmissionPrefilterMip` (2da4beb386509b77),
+  `GpuParticleUpdate:CS_Visibility` (369cbe906ea72764), `sr_tracing:CS_Tiling_Generate_Opaque`
+  (2cc4c197ee29e291), `vfx_triangleClip:CS_DefragHeap_ComputeRelocations` (02384a60fda6f2d0),
+  `vfx_triangleClip:CS_CollectTriangles_Meshlets` (6b82bc7d22016cb5), `water_shading:
+  CS_TransmissionVolumetrics_Tiled[_LocalLights]` (5dc3b25986622949, 6f225b641c5b0708). Three more
+  (477b52e73ddeb6f2, 17af85f170e66f30, 8b437ab61d8008fe) fail to translate for wave 32 ("a lane mask
+  exchanged where not every lane runs"); they write BC-format textures and are not in `shaders.rpf`,
+  the executable, `common.rpf`, `data.rpf` or `textures.rpf` (their containers are in the scratch
+  dumps a run makes with `VICTORY_SHADER_SAVE`). None is facial.
+- **Ruled out: the audio clock.** Speech is Opus through `XApu` (6,000+ stream activations a run,
+  dozens live at once: ambience uses it too), not XMA. The DSP (`XDsp`) only ever gets convolution
+  streams (reverb). Reporting the decoder's progress in the result's `state`/`state_data`/`usec`
+  (`VICTORY_APU_PROGRESS=1`, off; they were always 0) changed nothing. Raising the title's idle
+  threads (`VICTORY_TITLE_PRIORITIES=1`) changed nothing.
+- **Faces do animate** (head turns, eyes, brows): the facial system runs. Mouths stay shut while
+  speech-level, syllable-modulated audio plays (a WASAPI loopback loudness log beside screenshots
+  4 times a second; tools in the session's scratch folder: `loud.ps1`, `shots2.ps1`, `sheet.ps1`).
+- **Where the mouth shapes are made.** The pack has a GPU facial pipeline: `ped_standard_head_cs:
+  CS_ComputeBlendshapeMappings` (61e54e90adccaf6a), `CS_BlendshapeTranslationsHSSGraphOutputExtract`
+  (970c4fbb3b017c0e), `CS_ReconstructBlendshapeNormals` (e4a7e088c7780ce8), `CS_ComputeStickyLips`
+  (068c90badc86f1fd), `CS_AccumStretch*`, and a rig solver run as a compute graph,
+  `compute_graph_ops:CS_*` (65 programs: Add, BiasedDot, Clamp, Concat, ...; 24 used in the
+  cutscene). In the close-up frames (`VICTORY_CAPTURE_FRAMES=1500,1510,...`) they are all
+  dispatched, none dropped, and their null table entries (`970c…` `Srv s0+0`, `Uav s0+40`) are
+  the title's own null descriptors (resource 0, 0 elements), not ours. All translate exactly
+  (no approximate wave-64 forms; `068c…` with its early-outs left out).
+- **So the remaining suspects are the results**, not the dispatches: either the rig solver's
+  input (the animation's facial pose/viseme weights from the CPU) is at rest, or one of the graph
+  ops computes wrongly on this translation (reductions such as `BiasedDot` are the ones to doubt).
+  Next step: read back `970c…`'s output buffer (`Uav s0+48`, 1.4 MB) or the graph's output across
+  two frames of a line and see whether it changes; if it never does, test the graph ops one by one
+  on WARP against a straightforward host build of the same op.
+
+The original plan, kept for the record. What the user sees: in cutscenes the dialogue plays, but
+the characters' mouths do not move. Candidates as first listed, from most to least likely:
 
 1. **Facial animation computed on the card and dropped.** Seven compute pipelines are refused in
    run 40: the six listed in open problem 6 (they need waves of 64; Turing has only 32), and a new

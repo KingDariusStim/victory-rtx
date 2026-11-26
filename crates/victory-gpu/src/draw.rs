@@ -4535,8 +4535,11 @@ fn describe(view: Option<&View>) -> String {
     };
     match view {
         None => "no view".into(),
-        Some(v @ View::Shader(r, _)) => texture(*r as This)
-            .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
+        Some(v @ View::Shader(r, _)) => texture(*r as This).unwrap_or_else(|| match crate::descriptor::host::buffer_range(v) {
+            Some(range) => format!("buffer {range:?}"),
+            // (the view itself, to tell a null of the title's from a resource we do not know)
+            None => format!("buffer None {}", format!("{v:?}").chars().take(100).collect::<String>()),
+        }),
         Some(v @ View::Unordered(r, ..)) => match texture(*r as This) {
             Some(t) => format!("uav texture {t}"),
             None => format!(

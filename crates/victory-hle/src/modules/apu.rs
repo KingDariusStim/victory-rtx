@@ -132,6 +132,10 @@ pub struct Connection {
 
 struct State {
     streams: Vec<Option<OpusDecoder>>,
+    /// Frames decoded per stream since its activation: reported back as
+    /// the stream's position (experiment: a title timing its lip sync
+    /// from the decoder's progress saw 0 before).
+    decoded: Vec<u64>,
     /// Results not yet dequeued, per stream.
     queued: Vec<u32>,
     results: VecDeque<ApuResult>,
@@ -245,6 +249,7 @@ pub extern "system" fn XApuConnect(
         per_stream: input.commands_per_stream,
         state: Mutex::new(State {
             streams: (0..streams).map(|_| None).collect(),
+            decoded: vec![0; streams as usize],
             queued: vec![0; streams],
             results: VecDeque::new(),
             commands: 0,
@@ -308,7 +313,9 @@ pub extern "system" fn XApuEnqueueCommand(
         input_length: 0,
         input: std::ptr::null(),
     };
-    let decoder = &mut state.streams[stream];
+    let State { streams, decoded, .. } = &mut *state;
+    let decoder = &mut streams[stream];
+    let progress = &mut decoded[stream];
     match id.kind {
         ACTIVATE => {
             // SAFETY: an activate command is this struct.
@@ -324,6 +331,7 @@ pub extern "system" fn XApuEnqueueCommand(
                 match OpusDecoder::new(48_000, channels as usize) {
                     Ok(d) => {
                         *decoder = Some(d);
+                        *progress = 0;
                         S_OK
                     }
                     Err(e) => {
@@ -333,7 +341,10 @@ pub extern "system" fn XApuEnqueueCommand(
                 }
             };
         }
-        DEACTIVATE => *decoder = None,
+        DEACTIVATE => {
+            tracing::debug!(stream, "Opus stream deactivated");
+            *decoder = None;
+        }
         RESET => {
             if let Some(d) = decoder {
                 let _ = d.reset_state();
@@ -344,7 +355,15 @@ pub extern "system" fn XApuEnqueueCommand(
             // SAFETY: a process command is this struct.
             let command = unsafe { command.cast::<Process>().read_unaligned() };
             match decoder {
-                Some(d) => process(d, connection.options, &command, &mut result),
+                Some(d) => {
+                    process(d, connection.options, &command, &mut result);
+                    *progress += u64::from(result.frames);
+                    if apu_progress() {
+                        result.state = 1;
+                        result.state_data = *progress;
+                        result.usec = *progress * 1_000_000 / 48_000;
+                    }
+                }
                 None => {
                     let bytes = command.input_length;
                     failed(13, format_args!("a packet ({bytes} bytes) for stream {stream}, which is not active"));
@@ -369,6 +388,14 @@ pub extern "system" fn XApuEnqueueCommand(
         unsafe { SetEvent(connection.event) };
     }
     S_OK
+}
+
+/// Experiment (`VICTORY_APU_PROGRESS=1`): a process result reports the
+/// stream's frames decoded since activation in `state_data`, the same in
+/// microseconds in `usec`, and state 1.
+fn apu_progress() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_APU_PROGRESS").is_some_and(|v| v == "1"))
 }
 
 /// Decodes one packet into the command's output buffer, keeping the frames
