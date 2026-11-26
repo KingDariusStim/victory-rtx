@@ -244,7 +244,49 @@ of 7.2** with the texture sweep only just started (X: 7.4-7.9 GB at that point, 
 biggest target groups are now 1080p-class (2 x 1920x1080 RGBA16F) with 1536x1536 shadow cascades
 in place of 2048; the 3840x2160 buffers and the 2048x2048 mip chains stay. First world frames
 5.5 fps against 2.2-3.2 on X. The run was cut short at 199 s by a stale driver script of the
-previous run, not by a fault; run 22 is the full one. Runs 7-16 were driven unattended (a
+previous run, not by a fault. **Run 22**, the full one (8 minutes, after a `-Mode warm`): settled
+at 7,050-7,090 MB in use of 7,219, **under the budget and steady**, where the X profile sat 950 MB
+over; "passes that made none for lack of room" stayed at 8 all run against 1,642; targets 713 at
+1,370 MB; the texture copies grew to 3,389 MB because the sweep keeps textures longer while there
+is room (`vram_keep`), which is the intended trade. 7-8 fps in the prison yard. The picture is the
+same as on X otherwise: the orange wash and the blur are not memory. For an 8 GB card the S profile
+is the setting to play with; the run kit's README says so.
+
+## The per-draw view slots (the finding behind the dropped draws)
+
+Every frame line of runs 5-22 drops 450-630 draws "without a host pipeline (0 being made)" and
+1,300-1,850 indirect ones. The warm changes nothing (run 22 was after one), and the detail lines
+name the reasons: 266 a frame are stages of the ray-tracing structure builder, off by design; 1 a
+frame is the refused wave-64 compute `369cbe906ea72764`; 1 a compute that does not translate
+(`8b437ab61d8008fe`); and **256 a frame are indirect draws whose "prepare failed"**, with the
+comment in `draw.rs` saying what 256 indirect rectangle draws a frame are: the title's tiled
+lighting. The recording line says why they fail: **"dynamic slots: 12,310 tables asked, 2,083
+refused, 149 ms searching"** a frame in the world. On NVIDIA a view heap holds 1,000,000 views
+(`PORTABLE_VIEWS`): the title's slots take 737,856 and the per-draw ("dynamic") area is 2^18 =
+262,144 (`descriptor/host.rs`, `DYNAMIC`; AMD gets four times that). A draw's table gets a
+contiguous run as long as the shader's highest table offset plus one, holes included; a run is
+given back when the list's submission has run (`tables_done`); a table that finds no run is
+refused and its draw dropped, after a search of the whole ring when enough slots are free but in
+pieces. So the lighting draws and some 2,000 other tables a frame go unmade. This is the likeliest
+single cause of the dark and wrong lighting here, and it costs 149 ms a frame of searching on top.
+The build after run 22 names the reason on each "prepare failed" (pipeline kind, index buffer, or
+binding), to confirm.
+
+Two fixes, both more than an evening:
+1. **Compact tables**: have the translator lay out each pipeline's descriptor tables with only the
+   offsets its shaders read (renumbered 0..k, in the root signature's ranges and the shaders'
+   accesses alike), so a table whose shader reads three of 41 entries takes three slots. The host's
+   table code (`draw.rs` `fresh_tables`, `n` from the highest used offset) then shrinks by itself.
+   Changes the shader cache key.
+2. **A better allocator** for the dynamic area: size classes or a buddy scheme in place of the
+   first-fit ring (`HostHeap::dynamic`, `release`, `too_long`), so free slots in pieces still serve
+   small tables and the searches go. Add first a histogram of table lengths and the free count at
+   each refusal to size the classes.
+Cheaper and worth trying first: `VICTORY_DYNAMIC_SLOTS` is only read on uncapped hosts; on this
+one the split between the title's 737,856 slots and the per-draw 262,144 could be moved if the
+title's slot indices above some bound are rare (the frame line's "texture slots written so far"
+says how many slots the title writes; the handoff's run 4 note says it used 737,853 of 737,855,
+so probably not). Runs 7-16 were driven unattended (a
 PowerShell driver pressed Enter with a held key, took screenshots and logged the frame rate; a
 `SendKeys` press is too short for the title to see).
 
