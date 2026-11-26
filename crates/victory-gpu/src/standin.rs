@@ -23,22 +23,40 @@ use crate::host::{HostList, transition};
 const B5G5R5A1: u32 = DXGI_FORMAT_B5G5R5A1_UNORM.0 as u32;
 const B4G4R4A4: u32 = DXGI_FORMAT_B4G4R4A4_UNORM.0 as u32;
 const RGBA8: u32 = DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32;
+/// The title's packed HDR format (9-bit mantissas, a shared 5-bit exponent),
+/// which no PC card renders to; 16-bit float RGBA stands in for it
+/// (`crate::resource::target_format`).
+const R9G9B9E5: u32 = DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32;
+const RGBA16F: u32 = DXGI_FORMAT_R16G16B16A16_FLOAT.0 as u32;
 
 /// The conversion from `from` to `to` (formats), the shader's `mode`: 16-bit
-/// to RGBA8 (0, 1) or RGBA8 to 16-bit (2, 3). None for any other pair.
+/// colour to RGBA8 (0, 1) or back (2, 3); R9G9B9E5 to RGBA16F (4) or back
+/// (5). None for any other pair.
 pub(crate) fn mode(from: u32, to: u32) -> Option<u32> {
     match (from, to) {
         (B5G5R5A1, RGBA8) => Some(0),
         (B4G4R4A4, RGBA8) => Some(1),
         (RGBA8, B5G5R5A1) => Some(2),
         (RGBA8, B4G4R4A4) => Some(3),
+        (R9G9B9E5, RGBA16F) => Some(4),
+        (RGBA16F, R9G9B9E5) => Some(5),
         _ => None,
     }
 }
 
 /// Bytes per texel of the side a mode reads (`source`) or writes.
 fn texel_bytes(mode: u32, source: bool) -> u32 {
-    if (mode < 2) == source { 2 } else { 4 }
+    match (mode, source) {
+        (0 | 1, true) | (2 | 3, false) => 2,
+        (4, false) | (5, true) => 8,
+        _ => 4,
+    }
+}
+
+/// Threads along a row for a destination `width` texels wide: one a texel,
+/// but for the 16-bit colour formats, where one writes two (a dword).
+fn threads_x(mode: u32, width: u32) -> u32 {
+    if mode == 2 || mode == 3 { width.div_ceil(2) } else { width }
 }
 
 /// UNORM expansions and their rounding inverses, as the hardware converts:
@@ -86,6 +104,26 @@ uint narrow(uint x) {
     return ((b * 15u + 127u) / 255u) | (((g * 15u + 127u) / 255u) << 4)
         | (((r * 15u + 127u) / 255u) << 8) | (((a * 15u + 127u) / 255u) << 12);
 }
+// R9G9B9E5 as Direct3D reads it: three 9-bit mantissas, no implied bit, a
+// 5-bit exponent biased by 15, a value of m * 2^(e - 15 - 9).
+float3 unpack_rgb9e5(uint v) {
+    float scale = exp2(float(int(v >> 27)) - 24.0);
+    return float3(float(v & 511u), float((v >> 9) & 511u), float((v >> 18) & 511u)) * scale;
+}
+// The packing the format's specification gives: the shared exponent from
+// the largest component, mantissas rounded to nearest, the exponent one
+// higher where rounding would carry out of 9 bits. Negatives and NaN give
+// 0, as the hardware's conversion does; 65408 is the largest value.
+uint pack_rgb9e5(float3 c) {
+    c = min(max(c, 0.0), 65408.0);
+    float maxc = max(c.r, max(c.g, c.b));
+    if (!(maxc > 0.0)) return 0u;
+    int e = max(-16, int(floor(log2(maxc)))) + 16;
+    float denom = exp2(float(e - 24));
+    if (floor(maxc / denom + 0.5) >= 512.0) { e += 1; denom *= 2.0; }
+    uint3 m = uint3(floor(c / denom + 0.5));
+    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+}
 
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
@@ -93,6 +131,25 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint y = id.y, z = id.z;
     if (y >= height || z >= depth) return;
     uint row = z * dst_slice + y * dst_pitch;
+    if (mode == 4) {
+        // One packed HDR texel to four halves (alpha one).
+        uint x = id.x;
+        if (x >= width) return;
+        float3 c = unpack_rgb9e5(src.Load(source_address(x, y, z, 4u)));
+        uint lo = f32tof16(c.r) | (f32tof16(c.g) << 16);
+        uint hi = f32tof16(c.b) | (0x3c00u << 16);
+        dst.Store2(row + x * 8u, uint2(lo, hi));
+        return;
+    }
+    if (mode == 5) {
+        // Four halves to one packed HDR texel (alpha dropped).
+        uint x = id.x;
+        if (x >= width) return;
+        uint2 w = src.Load2(source_address(x, y, z, 8u));
+        float3 c = float3(f16tof32(w.x & 0xffffu), f16tof32(w.x >> 16), f16tof32(w.y & 0xffffu));
+        dst.Store(row + x * 4u, pack_rgb9e5(c));
+        return;
+    }
     if (mode < 2) {
         uint x = id.x;
         if (x >= width) return;
@@ -130,7 +187,7 @@ fn pipeline() -> Option<&'static (ID3D12RootSignature, ID3D12PipelineState)> {
         match made {
             Ok(made) => Some(made),
             Err(e) => {
-                tracing::warn!(error = %e, "no 16-bit colour conversion pipeline: such copies stay skipped");
+                tracing::warn!(error = %e, "no stand-in conversion pipeline: copies between stand-ins and the title's formats stay skipped");
                 None
             }
         }
@@ -285,7 +342,7 @@ pub(crate) fn convert(
         out_pitch * size[1],
         0,
     ];
-    let threads_x = if mode < 2 { size[0] } else { size[0].div_ceil(2) };
+    let threads_x = threads_x(mode, size[0]);
     let to_output = buffer_location(&out, footprint(to_format, size, out_pitch));
     let destination = texture_location(to, to_sub);
     // SAFETY: an open list; our root signature and pipeline (kept for the
@@ -505,6 +562,87 @@ mod tests {
                 }
             }
             eprintln!("format {format}: {unlike_card} of {} texels one step off the card's own reading", w * h);
+        }
+    }
+
+    /// The bits of a finite `f32` that `f16` holds exactly (the values of
+    /// R9G9B9E5 all are: 9 significant bits, 2^-24 to 65408).
+    fn f16_bits(v: f32) -> u16 {
+        let bits = v.to_bits();
+        let (sign, exp, mant) = ((bits >> 31) as u16, ((bits >> 23) & 0xff) as i32, bits & 0x7f_ffff);
+        if exp == 0 && mant == 0 {
+            return sign << 15;
+        }
+        let e = exp - 127 + 15;
+        if e >= 1 {
+            sign << 15 | (e as u16) << 10 | (mant >> 13) as u16
+        } else {
+            // Subnormal: the implied bit back, shifted down.
+            let m = (mant | 0x80_0000) >> (13 + 1 - e);
+            sign << 15 | m as u16
+        }
+    }
+
+    /// R9G9B9E5 words as the format's encoder makes them (the largest
+    /// mantissa at least 256 unless the exponent is 0), through the 16-bit
+    /// float stand-in and back: the halves hold exactly what the words
+    /// mean, and the words come back as they were.
+    #[test]
+    fn packed_hdr_survives_the_half_float_stand_in_both_ways() {
+        let Some(host) = crate::host::host() else {
+            assert!(std::env::var_os("VICTORY_D3D12_WARP").is_none(), "WARP unavailable");
+            return;
+        };
+        let (w, h) = (255u32, 130u32);
+        // Every exponent, mantissas across the range, each channel the
+        // largest in turn; zero and the largest value among them.
+        let mut words: Vec<u32> = vec![0, 511 | 511 << 9 | 511 << 18 | 31 << 27];
+        let mut seed = 0x9e37_79b9u32;
+        while words.len() < (w * h) as usize {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let e = (seed >> 27) & 31;
+            let largest = if e == 0 { (seed >> 3) & 511 } else { 256 + ((seed >> 3) & 255) };
+            let other = |s: u32| (s % (largest + 1)) & 511;
+            let (a, b) = (other(seed >> 12), other(seed.rotate_left(7)));
+            let (r, g, bl) = match (seed >> 1) % 3 {
+                0 => (largest, a, b),
+                1 => (a, largest, b),
+                _ => (a, b, largest),
+            };
+            words.push(r | g << 9 | bl << 18 | e << 27);
+        }
+        let pitch = (w * 4).next_multiple_of(256);
+        let (upload, data) = host.upload_buffer(u64::from(pitch * h)).unwrap();
+        for y in 0..h {
+            for x in 0..w {
+                // SAFETY: inside our mapped upload buffer.
+                unsafe { data.add((y * pitch + x * 4) as usize).cast::<u32>().write_unaligned(words[(y * w + x) as usize]) };
+            }
+        }
+        let wide = texture(host, RGBA16F, w, h);
+        let back = texture(host, R9G9B9E5, w, h);
+        let list = host.new_list().unwrap();
+        let source = Source::Buffer { buffer: &upload, offset: 0, format: R9G9B9E5, pitch, height: h };
+        assert!(convert(&list, &wide, 0, [0; 3], source, Some([0, 0, 0, w, h, 1])));
+        barrier(&list, &wide, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        assert!(convert(&list, &back, 0, [0; 3], Source::Texture { texture: &wide, sub: 0 }, None));
+        barrier(&list, &back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        let (wide_back, wide_pitch) = read_back(host, &list, &wide, 8);
+        let (packed_back, packed_pitch) = read_back(host, &list, &back, 4);
+        list.close();
+        host.execute(&[&list]);
+        let halves: Vec<u16> = mapped(&wide_back, (wide_pitch / 2 * h) as usize);
+        let packed: Vec<u32> = mapped(&packed_back, (packed_pitch / 4 * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let v = words[(y * w + x) as usize];
+                let scale = 2f32.powi((v >> 27) as i32 - 24);
+                let want = [(v & 511) as f32 * scale, ((v >> 9) & 511) as f32 * scale, ((v >> 18) & 511) as f32 * scale];
+                let at = (y * wide_pitch / 2 + x * 4) as usize;
+                let got = &halves[at..at + 4];
+                assert_eq!(got, [f16_bits(want[0]), f16_bits(want[1]), f16_bits(want[2]), 0x3c00], "word {v:#010x} widened");
+                assert_eq!(packed[(y * packed_pitch / 4 + x) as usize], v, "word {v:#010x} back");
+            }
         }
     }
 

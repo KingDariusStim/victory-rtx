@@ -35,6 +35,7 @@ param(
     [switch] $Release,
     [switch] $Fast,
     [switch] $Book,
+    [ValidateSet('series-x', 'series-s')] [string] $Console = 'series-x',
     [hashtable] $Set = @{}
 )
 
@@ -121,7 +122,7 @@ $arguments = switch ($Mode) {
     'check' { @('inspect', "`"$Game`"", '--imports') }
     'shaders' { @('shaders', "`"$GameDir`"") }
     'warm' { @('warm', '--used') }
-    'run' { @('run', "`"$Game`"", '--execute', '--console', 'series-x', '--unimplemented', 'trap') }
+    'run' { @('run', "`"$Game`"", '--execute', '--console', $Console, '--unimplemented', 'trap') }
 }
 if ($Mode -eq 'check') {
     Push-Location $DataDir
