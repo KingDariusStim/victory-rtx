@@ -1894,6 +1894,15 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Ranges declared written by shaders since the list last wrote title
+    /// memory (host copy, address, bytes): declaring them again would
+    /// change nothing. (From Belobug dd799aad, romainhedouin, as ported in
+    /// avatarmanz/VIctory-7900XTX b32fb99.)
+    gpu_written: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    /// Scratch memory [`HostList::fill_scratch`] fills since the list last
+    /// wrote title memory (source, bytes): its host address. (From Belobug
+    /// 84ea9c12, romainhedouin, as ported in avatarmanz/VIctory-7900XTX c96525d.)
+    filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Numbered guest memory copies already prepared by this list.
@@ -1942,9 +1951,17 @@ impl RawCopyCoverage {
     }
 }
 
+/// See [`HostList::defer_gpu_write`].
+fn declare_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DECLARE_ONCE").map_or(true, |v| v != "0"))
+}
+
 impl Deferred {
     fn invalidate_refreshes(&mut self) {
         self.refreshed.clear();
+        self.gpu_written.clear();
+        self.filled.clear();
         self.raw_copies.read = 0;
     }
 
@@ -5749,15 +5766,35 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// Declared once until the list next writes title memory (but with
+    /// `VICTORY_DECLARE_ONCE=0`): the dispatches of a frame declared the
+    /// same ranges thousands of times, each a step of its own.
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) || !declare_once() {
+            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        }
+    }
+
+    /// The host address of `len` bytes of scratch memory that hold the title
+    /// memory at `src` as of the list's submission: one fill for every ask
+    /// until the list next writes title memory.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        let known = self.deferred().filled.get(&key).copied();
+        if known.is_some() {
+            return known;
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
