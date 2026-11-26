@@ -103,8 +103,14 @@ on top of `scripts\play.ps1`'s settings, plus `VICTORY_PIPELINE_BOOK=1`.
    (`resource.rs`, 3 GB default) and `card_room_kept()` (`crates/victory-gpu/src/shadow.rs`, 1 GB).
    For example a seventh and a twentieth of the budget, which keeps 3 GB and 1 GB on a 24 GB card.
    Worth offering to avatarmanz upstream.
-6. **Convert R9G9B9E5 stand-in copies** in `standin.rs` (format 67 <-> RGBA16F), then see whether the
-   blue sky goes. Resolves between stand-ins are also still skipped (counted in the report line).
+6. **R9G9B9E5 stand-in copies**: converted now (`standin.rs` modes 4 and 5, format 67 <-> RGBA16F,
+   with a test that runs every exponent through both ways exactly). Run 20 then showed the stand-in
+   report line at "copies converted: 0 into a stand-in, 0 out of one; skipped: 0 into, 0 out of" in
+   the prison yard, and the bloom unchanged: in that scene the title makes no such copies at all, so
+   problem 3's cause is elsewhere. Left on its list: the six refused wave-64 compute programs
+   (problem 6), the title's exposure or tonemap reading a target a dropped pass never filled, and
+   resolves between stand-ins, which are still skipped. Other scenes (the open sky) may copy where
+   the yard does not; the report line says.
 7. **Vsync option**: `Present(1, 0)` (or 2 at 30 fps) behind a switch.
 8. **Temporal ghosting**: find the pass writing motion vectors and check it runs (dropped draws,
    refused pipelines); a switch that drops TAA history would confirm.
@@ -216,8 +222,29 @@ in this tree now:
   16.5 GB had they been whole), so what is left to cap is little. Kept as a switch.
 - The memory line now lists, with every sixth one, the host-rendered copies by shape
   (`targets_by_shape`): the fourteen groups holding the most bytes, as count, width x height,
-  format, flags, levels and MB. That is where to look for aliased or transient targets the host
-  keeps a copy of each. Runs 7-16 were driven unattended (a
+  format, flags, levels and MB. Run 19, the prison yard: 722 copies, 3,015 MB, **none idle** (the
+  "sweep never lets go" line: 0 unused for 30 s). The biggest groups: 12 x 2560x1440 RGBA8 (180 MB),
+  6 x 2560x1440 R16G16F, 6 x 2560x1440 RGBA16F, 5 x 2560x1440 R16G16F, 4 x 2048x2048 RGBA8 with 12
+  levels, 4 x 2048x2048 R16 depth (shadow cascades), 2 x 3840x2160 RGBA8 and a 3840x2160 R32 depth,
+  12 x 1280x720 R16G16F, then a long tail of ~1.9 GB in smaller ones. That is a renderer's working
+  set at this resolution, not duplicates: the console's 10 GB of fast memory affords it, 8 GB does
+  not, together with 1.8 GB of the title's textures and 0.6 GB of buffer copies.
+
+So the lever for this card is not in the copies but in what the title renders: the **Series S
+profile** (`victory run --console series-s`; the run kit now takes `-Console series-s`), under
+which the title sizes its targets and textures for a 1440p-class, 8 GB-class console, or an
+internal-resolution cap if the profile alone does not fit. avatarmanz's findings list the S profile
+under "measured and not worth it" for speed on a 24 GB card; for memory on an 8 GB card it is the
+first thing to measure. Residency priorities would not help here: with every target in use each
+frame, paging them is a stall a frame.
+
+**Run 21, Series S** (`-Console series-s`), 50 s after the first world frame: host-rendered copies
+528 alive **1,249 MB** (X profile at the same point: 2,585 MB; settled, 3,015), the card **6.5 GB
+of 7.2** with the texture sweep only just started (X: 7.4-7.9 GB at that point, 8.2 settled). The
+biggest target groups are now 1080p-class (2 x 1920x1080 RGBA16F) with 1536x1536 shadow cascades
+in place of 2048; the 3840x2160 buffers and the 2048x2048 mip chains stay. First world frames
+5.5 fps against 2.2-3.2 on X. The run was cut short at 199 s by a stale driver script of the
+previous run, not by a fault; run 22 is the full one. Runs 7-16 were driven unattended (a
 PowerShell driver pressed Enter with a held key, took screenshots and logged the frame rate; a
 `SendKeys` press is too short for the title to see).
 

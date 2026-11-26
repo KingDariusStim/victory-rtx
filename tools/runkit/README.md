@@ -43,6 +43,7 @@ Backspace=B, Esc=Menu). Close the window to end a run; the summary prints after.
 | `-Fresh` | a new save/state folder (first-boot screens again) |
 | `-Warp` | software renderer (very slow) |
 | `-Release` | `target\release` instead of the diagnostics build |
+| `-Console series-s` | the Series S profile (`series-x` is the default). On an 8 GB card the X profile's render targets alone are 3 GB and the card runs 1 GB over its budget; under the S profile they are 1.2 GB and the card stays under it (handoff, "What fills the 8 GB") |
 | `-Set @{ NAME = 'value' }` | any other `VICTORY_*` switch for this run |
 
 ## First results on an RTX 2080 SUPER (2026-11-25, the DexNom-based tree)
