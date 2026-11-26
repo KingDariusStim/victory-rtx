@@ -348,6 +348,23 @@ index, `lower.rs` ~3022, so the translator would renumber those offsets).
   gives it (a host word per view, `USER_CBV_INDEX`), the rest of the table stays on the title's
   own slots, holes and all, and a long table costs one or two slots instead of 175.
 
+**Done (run 33, commit b901e86): constant buffer views out of the tables.** The translator
+(`lower.rs` `cbv_index`) reads a table's constant buffer view at a fixed offset at a heap index
+the host gives (`USER_CBV_INDEX`), and asks `USER_TABLE_WHOLE` for a table one of whose views it
+reads any other way (`note_whole_table`). The host (`draw.rs` `tables`, `cbv_slot`) gives each such
+view a slot of its own with what it read at the draw, and leaves the rest of the table on the
+title's slots (`VICTORY_CBV_SPLIT=0`: whole tables as before). Run 33: **tables refused 0.02% a
+frame** (16.7% before), indirect draws dropped 0 by the end of the run (about 1,900), no long
+table made whole, 34,670 slots free in 651 stretches; the cell clean in the captures. A
+translator change re-translates every shader: `-Mode shaders` (194 s with 8 processes) and
+`-Mode warm` (2,560 pipelines, 316 s); the draws no longer dropped then need pipelines no book had
+(run 33 ran at 2.5-3 fps while 600 were made in play; a second warm after it).
+**The blur was the refused tables.** The opening holds a long shot of Lucia at the cell window:
+in run 31 (before) it is the banded blur of "0/20 vision", thickening and never recovering; in
+run 34 (after, 4,000 frames of it) it is sharp and clean throughout, Lucia's hair no longer red.
+Run 34: refused 0.05%, 5.5 fps with 4,405 draws a frame (run 32: 6.8 fps, 3,788 draws, the rest
+dropped).
+
 **What the refusals look like on screen (run 26, `VICTORY_CAPTURE_WORLD`).** The presented frames
 every 8th frame show, walking from the cell to the yard: a rectangle of an older picture over the
 new one (frames 5075-5123 of that run), the "jumps to frames a second or two old" seen in play;
