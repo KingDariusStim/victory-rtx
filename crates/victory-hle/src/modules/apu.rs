@@ -143,6 +143,45 @@ fn lock(c: &Connection) -> std::sync::MutexGuard<'_, State> {
     c.state.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// What the decoder did since the start, to see where a title's streams
+/// stop (music and dialogue silent while effects play): [0..=8] activations
+/// by channel count (8: more than 7), [9] activations refused, [10] packets
+/// decoded, [11] frames decoded, [12] bad packets, [13] packets for a stream
+/// never activated, [14] packets without input or output, [15] commands.
+static COUNTS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
+fn count(i: usize, n: u64) -> u64 {
+    COUNTS[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n
+}
+
+/// A failure's first five occurrences of each kind (`slot` 9, 12, 13, 14)
+/// logged with what the title passed.
+fn failed(slot: usize, what: std::fmt::Arguments) {
+    if count(slot, 1) <= 5 {
+        tracing::warn!("audio decoder: {what}");
+    }
+}
+
+/// The counts, every 8,192 commands.
+fn report() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = COUNTS.each_ref().map(|c| c.load(Relaxed));
+    let by_channels: Vec<String> =
+        (0..9).filter(|&i| c[i] > 0).map(|i| format!("{}{}ch: {}", i, if i == 8 { "+" } else { "" }, c[i])).collect();
+    tracing::info!(
+        "audio decoder: {} commands; streams activated [{}], {} refused; {} packets decoded ({} frames); \
+         {} bad packets, {} for a stream not active, {} without input or output",
+        c[15],
+        by_channels.join(", "),
+        c[9],
+        c[10],
+        c[11],
+        c[12],
+        c[13],
+        c[14]
+    );
+}
+
 pub extern "system" fn XApuConnect(
     input: *const ConnectInput,
     output: *mut ConnectOutput,
@@ -275,9 +314,11 @@ pub extern "system" fn XApuEnqueueCommand(
             // SAFETY: an activate command is this struct.
             let channels = unsafe { command.cast::<Activate>().read_unaligned() }.channels;
             tracing::debug!(stream, channels, "Opus stream activated");
+            count((channels as usize).min(8), 1);
             result.error = if decoder.is_some() {
                 ALREADY_ACTIVE
             } else if !(1..=2).contains(&channels) {
+                failed(9, format_args!("stream {stream} refused: {channels} channels (1 or 2 are decoded)"));
                 E_INVALIDARG
             } else {
                 match OpusDecoder::new(48_000, channels as usize) {
@@ -285,7 +326,10 @@ pub extern "system" fn XApuEnqueueCommand(
                         *decoder = Some(d);
                         S_OK
                     }
-                    Err(_) => E_INVALIDARG,
+                    Err(e) => {
+                        failed(9, format_args!("stream {stream} refused: {channels} channels, {e:?}"));
+                        E_INVALIDARG
+                    }
                 }
             };
         }
@@ -301,10 +345,17 @@ pub extern "system" fn XApuEnqueueCommand(
             let command = unsafe { command.cast::<Process>().read_unaligned() };
             match decoder {
                 Some(d) => process(d, connection.options, &command, &mut result),
-                None => result.error = INVALID_STREAM,
+                None => {
+                    let bytes = command.input_length;
+                    failed(13, format_args!("a packet ({bytes} bytes) for stream {stream}, which is not active"));
+                    result.error = INVALID_STREAM;
+                }
             }
         }
         _ => return INVALID_COMMAND,
+    }
+    if count(15, 1).is_multiple_of(8192) {
+        report();
     }
     state.queued[stream] += 1;
     state.commands = state.commands.wrapping_add(1);
@@ -330,6 +381,7 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     result.input_length = input_length;
     result.output = output;
     if input.is_null() || output.is_null() || input_length == 0 {
+        failed(14, format_args!("a packet with input {input:?} ({input_length} bytes), output {output:?}"));
         result.error = E_INVALIDARG;
         return;
     }
@@ -338,12 +390,16 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     let mut pcm = vec![0f32; MAX_FRAMES * channels];
     let decoded = match decoder.decode(packet, MAX_FRAMES, &mut pcm) {
         Ok(n) => n,
-        Err(_) => {
+        Err(e) => {
+            let head: Vec<String> = packet.iter().take(4).map(|b| format!("{b:02x}")).collect();
+            failed(12, format_args!("bad packet ({input_length} bytes, {channels} channels, first bytes {}): {e:?}", head.join(" ")));
             result.error = BAD_PACKET;
             return;
         }
     };
-    let first = (command.first_frame as usize).min(decoded);
+    count(10, 1);
+    count(11, decoded as u64);
+    let first =(command.first_frame as usize).min(decoded);
     let frames = (decoded - first)
         .min(command.frame_count as usize)
         .min(output_length as usize / (4 * channels));
