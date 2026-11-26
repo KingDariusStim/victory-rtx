@@ -6,7 +6,7 @@
 > [Marvisak/VIctory](https://github.com/Marvisak/VIctory), with work from DexNom, Belobug,
 > romainhedouin and the others named under Credits below. It is distributed under the same
 > license, GPL-3.0-or-later ([LICENSE](LICENSE)), with no warranty. The changes made here, from
-> 2026-11-25, target NVIDIA GPUs (tested on an RTX 2080 SUPER with a Ryzen 7 3700X) and are
+> 2026-11-25, target NVIDIA GPUs (tested on an RTX 2080 SUPER with a Ryzen 5 5600 and 32 GB of RAM) and are
 > recorded in the git history, each commit naming where it was ported from
 > ([KingDariusStim/victory-rtx](https://github.com/KingDariusStim/victory-rtx), branch `nvidia`):
 >
@@ -17,6 +17,9 @@
 > - audio-decoder counters and failure logging (`crates/victory-hle/src/modules/apu.rs`);
 > - a Windows run kit with a log summarizer (`tools/runkit`), whose `-Fast` uses the settings
 >   of `scripts\play.ps1`.
+>
+> State of the NVIDIA work, what was measured, open problems, next steps and quirks:
+> [docs/HANDOFF-nvidia.md](docs/HANDOFF-nvidia.md).
 >
 > **No game content.** This repository contains no game files, code or assets, and none are
 > distributed: you need your own legally obtained copy, and everything is derived from it on your
