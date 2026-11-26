@@ -888,6 +888,33 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // Diagnostics: the plane descriptions as the title passes them, raw,
+    // once for each plane count and first resources (the title's 2D screens
+    // reach the window black: only the first plane's first resource is shown).
+    #[cfg(feature = "diagnostics")]
+    if !plane_parameters.is_null() && planes > 0 && planes <= 4 {
+        static SEEN: std::sync::Mutex<Vec<(u32, Vec<usize>)>> = std::sync::Mutex::new(Vec::new());
+        // SAFETY: the title passes `planes` descriptions; 64 bytes each are
+        // read as words (the record is at least that long on the console).
+        let words: Vec<u64> = (0..planes as usize * 8)
+            .map(|i| unsafe { plane_parameters.cast::<u64>().add(i).read_unaligned() })
+            .collect();
+        // The first resource of each plane.
+        let firsts: Vec<usize> = (0..planes as usize)
+            .filter_map(|p| {
+                // SAFETY: as above.
+                let plane = unsafe { &*plane_parameters.cast::<u8>().add(p * PLANE_STRIDE).cast::<Plane>() };
+                (plane.count > 0 && !plane.resources.is_null())
+                    // SAFETY: the plane lists `count` resources.
+                    .then(|| unsafe { *plane.resources } as usize)
+            })
+            .collect();
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() < 16 && !seen.iter().any(|s| s.0 == planes && s.1 == firsts) {
+            seen.push((planes, firsts.clone()));
+            tracing::info!(frame, planes, firsts = ?firsts.iter().map(|r| format!("{r:#x}")).collect::<Vec<_>>(), words = ?words.iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>(), "present planes, raw");
+        }
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -924,54 +951,55 @@ extern "system" fn present(
             crate::capture::dump_targets(frame);
         }
     }
+    // The second plane: the title's 2D screens and its overlay (menus, the
+    // title screen, the HUD), shown over the first. Before, only the first
+    // was shown, and every 2D screen before the world reached the window
+    // black (run 37: the title screen drawn into the second plane's target).
+    #[cfg(windows)]
+    let overlay = (overlay_on()).then(|| plane_resource(planes, plane_parameters, 1)).flatten();
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
         const COPY_SOURCE: u32 = 0x800;
-        let texture = if planes > 0
-            // SAFETY: the title passes `planes` plane descriptions.
-            && let Some(plane) = unsafe { plane_parameters.as_ref() }
-            && plane.count > 0
-            && !plane.resources.is_null()
-        {
-            // SAFETY: the plane lists `count` resources.
-            let resource = unsafe { *plane.resources };
-            // The state the lists recorded so far leave it in (the next
-            // frame's, recorded before this is shown, go on from there).
+        // The host copy of `resource` and the state the lists recorded so
+        // far leave it in (the next frame's, recorded before this is shown,
+        // go on from there).
+        let held = |resource: This| {
             crate::resource::host_copy(resource).map(|copy| {
                 let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
                 crate::resource::host_transition(resource, state);
                 // (Lists not translated yet leave it in no state yet: the
                 // one it is in when its turn in the line comes.)
                 let state = if crate::list::thin::wanted() { u32::MAX } else { state };
-                (resource as usize, copy, state)
+                (copy, state)
             })
-        } else {
-            None
         };
-        let resource = texture.as_ref().map_or(0, |t| t.0);
-        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource });
+        let first = plane_resource(planes, plane_parameters, 0);
+        let texture = first.and_then(held);
+        let resource = first.filter(|_| texture.is_some()).map_or(0, |r| r as usize);
+        let overlay = overlay.and_then(held);
+        behind::present(this, texture, overlay, Shown { frame, resource });
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
         return S_OK;
     }
     #[cfg(windows)]
-    if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
+    if let Some(resource) = plane_resource(planes, plane_parameters, 0)
         && let Some(texture) = crate::resource::host_resource(resource)
-        && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        show(texture, state, Shown { frame, resource: resource as usize });
+        let over = overlay.and_then(|o| {
+            let texture = crate::resource::host_resource(o)?;
+            let state = crate::resource::host_transition(o, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+            Some((o, texture, state))
+        });
+        show(texture, state, over.as_ref().map(|(_, t, s)| (*t, *s)), Shown { frame, resource: resource as usize });
         crate::resource::host_transition(resource, state);
-        let _ = host;
+        if let Some((o, _, s)) = over {
+            crate::resource::host_transition(o, s);
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
@@ -1008,13 +1036,43 @@ struct Shown {
     resource: usize,
 }
 
-/// Shows `texture`, in host state `state`, in our window.
+/// Bytes between the title's present plane descriptions: run 38 found the
+/// second plane's token, resource count and resources 72 bytes after the
+/// first's (token, count, resources, source rectangles, placement, then
+/// colour space, filter and flags).
+const PLANE_STRIDE: usize = 72;
+
+/// The first resource of present plane `i`, if the title passes one.
+fn plane_resource(planes: u32, plane_parameters: *const Plane, i: u32) -> Option<This> {
+    if i >= planes || plane_parameters.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes `planes` descriptions, `PLANE_STRIDE` apart.
+    let plane = unsafe { &*plane_parameters.cast::<u8>().add(i as usize * PLANE_STRIDE).cast::<Plane>() };
+    // SAFETY: the plane lists `count` resources.
+    (plane.count > 0 && !plane.resources.is_null()).then(|| unsafe { *plane.resources }).filter(|r| !r.is_null())
+}
+
+/// Whether the second present plane is shown over the first
+/// (`VICTORY_OVERLAY_PLANE=0`: the first alone, as before).
 #[cfg(windows)]
-fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32, what: Shown) {
+fn overlay_on() -> bool {
+    crate::toggled!("VICTORY_OVERLAY_PLANE")
+}
+
+/// Shows `texture`, in host state `state`, in our window, with `overlay`
+/// (the second plane, in its host state) over it.
+#[cfg(windows)]
+fn show(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    state: u32,
+    overlay: Option<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+    what: Shown,
+) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present(texture, state, what.frame);
+    let shown = host.present(texture, state, overlay, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]

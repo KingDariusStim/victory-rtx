@@ -3761,6 +3761,7 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
+mod overlay;
 #[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
@@ -8661,6 +8662,9 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// The second present plane's blend (`None` until a present has one;
+    /// `Some(None)`: it cannot be made).
+    composite: Option<Option<overlay::Composite>>,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
@@ -9059,7 +9063,15 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// `overlay`: the title's second present plane, in its host state,
+    /// blended over `texture` (`overlay::Composite`).
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -9135,21 +9147,25 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            // The second plane over the first, into a texture of the
+            // window's: `texture` is left in the copy source state.
+            let composed = overlay.and_then(|(o, over)| {
+                let c = p.composite.get_or_insert_with(|| overlay::Composite::new(self)).as_mut()?;
+                c.record(self, list, texture, state, o, D3D12_RESOURCE_STATES(over as i32), (width, height), format)
+            });
+            let mut barriers = vec![transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
+            if composed.is_none() {
+                barriers.insert(0, transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
+            }
+            list.ResourceBarrier(&barriers);
+            let shown = composed.as_ref().unwrap_or(texture);
+            list.CopyResource(&back, shown);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| crate::capture::read_back(&self.device, list, shown))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, shown) };
             #[cfg(feature = "diagnostics")]
             let watched = crate::popwatch::take(&self.device, list, texture);
             #[cfg(feature = "diagnostics")]
@@ -9245,6 +9261,7 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                composite: None,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })
