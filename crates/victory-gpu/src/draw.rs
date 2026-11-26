@@ -3166,6 +3166,8 @@ impl State {
                 fresh.push(u.slot);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let cbv: Vec<u8> = fresh.to_vec();
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -3305,15 +3307,75 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                let n64 = u64::from(n);
+                if cbv.contains(&slot) {
+                    add(C::DynamicCbvTables, 1);
+                    add(C::DynamicCbvSlots, n64);
+                } else {
+                    add(C::DynamicPastTables, 1);
+                    add(C::DynamicPastSlots, n64);
+                }
+                if n > 64 {
+                    add(C::DynamicLongTables, 1);
+                    add(C::DynamicLongSlots, n64);
+                    // Which offsets a long table's readers name: the first
+                    // patterns seen, to judge laying tables out compactly.
+                    static PATTERNS: std::sync::Mutex<Vec<Vec<u32>>> = std::sync::Mutex::new(Vec::new());
+                    let mut read: Vec<u32> = entries().map(|u| u.table_offset_dwords / 8).chain(selected.iter().copied()).collect();
+                    read.sort_unstable();
+                    read.dedup();
+                    let mut patterns = PATTERNS.lock().unwrap_or_else(|e| e.into_inner());
+                    if patterns.len() < 60 && !patterns.contains(&read) {
+                        tracing::info!(
+                            n,
+                            cbv = cbv.contains(&slot),
+                            indexed = selected.len(),
+                            reads = read.len(),
+                            offsets = ?read,
+                            "a long fresh table: the offsets its readers name"
+                        );
+                        patterns.push(read);
+                    }
+                }
+                // Made already in this frame by another list?
+                static FRAME: std::sync::Mutex<(u64, Option<std::collections::HashSet<(usize, (u64, u32, u64))>>)> =
+                    std::sync::Mutex::new((u64::MAX, None));
+                let mut frame = FRAME.lock().unwrap_or_else(|e| e.into_inner());
+                let now = crate::queue::presented();
+                if frame.0 != now {
+                    *frame = (now, Some(Default::default()));
+                }
+                if frame.1.get_or_insert_with(Default::default).insert((std::ptr::from_ref(heap) as usize, key)) {
+                    add(C::DynamicDistinctTables, 1);
+                    add(C::DynamicDistinctSlots, n64);
+                }
+            }
+            // The offsets the table's readers name: the entries and those
+            // picked by index. A long table mostly holes takes slots at
+            // these alone (`descriptor::slab::Sparse`); its holes lie on
+            // other tables' slots, which its shaders never read.
+            let mut reads: Vec<u32> = entries().map(|u| u.table_offset_dwords / 8).chain(selected.iter().copied()).collect();
+            reads.sort_unstable();
+            reads.dedup();
+            let sparse_first = (crate::descriptor::host::sparse_tables() && n > 16 && reads.len() * 2 <= n as usize)
+                .then(|| host.dynamic_sparse(&reads))
+                .flatten();
+            let sparse = sparse_first.is_some();
+            let Some(first) = sparse_first.or_else(|| host.dynamic(n)) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            self.dynamic.push((
+                std::ptr::from_ref(heap) as usize,
+                first,
+                if sparse { n | crate::descriptor::host::SPARSE } else { n },
+            ));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -3332,8 +3394,12 @@ impl State {
             }
             let recording = self.recording;
             // The whole range: a shader may index past the entries its
-            // used-resource list names (descriptor arrays).
-            for k in 0..n {
+            // used-resource list names (descriptor arrays). Of a sparse
+            // table, the slots it holds alone: the rest are others'.
+            let mut whole = 0..n;
+            let mut held = reads.iter().copied();
+            let offsets: &mut dyn Iterator<Item = u32> = if sparse { &mut held } else { &mut whole };
+            for k in offsets {
                 let index = first + k;
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.

@@ -294,6 +294,68 @@ so probably not). Runs 7-16 were driven unattended (a
 PowerShell driver pressed Enter with a held key, took screenshots and logged the frame rate; a
 `SendKeys` press is too short for the title to see).
 
+**Fix 2 is in (2026-11-26, `descriptor/slab.rs`).** The dynamic area is cut into pages of 256
+slots. A page is free, or carved for one size class (every length to 16, then 24, 32, 48, 64, 96,
+128, 192, 256), or part of a run of whole pages for a table longer than 256. A table takes a run
+of the smallest class that holds it, popped from that class's free list, carving a page from the
+pool when the list is empty; giving back pushes it again, and a page whose runs are all back
+returns to the pool for any class (free runs noted before that are skipped by a generation
+count). Take and give are a pop and a push under the lock, with no search, so the 149 ms goes;
+and free slots in pieces serve every table of their class, which the ring could not. The cost is
+the round-up inside a class (a 17-slot table takes 24) and pages held by a class while partly
+used. Each page keeps a bit per run, so a run given back twice is not handed out twice. The
+recording line's "dynamic slots" counts stay; a new line after it, "dynamic slots now", gives
+the free slots, the pool's pages and the free runs per class, to see whether a class starves.
+`VICTORY_DYNAMIC_SLOTS` and the area's size are as before. Fix 1 (compact tables) is still worth
+doing: it shrinks what every table asks for.
+
+**Runs 24-27 (2026-11-26 01:00-01:40): the area is full, not in pieces.** The slab's first form
+(free runs last given, first taken) refused 2,700-3,600 of 10,600-11,700 tables a frame, more than
+the ring's 2,083, with 78,000 slots free and 4 pages in the pool: every class spread over many
+pages, each held by a table or two. The second form (lowest page first, borrowing a larger class)
+refused about as many, and run 25 ended with 2,924 slots free and no page in the pool: the 262,144
+slots are simply taken. The search time fell from 149 ms to 6-11 ms a frame either way. Run 27
+counted the demand (new tables a frame, in the prison cell): **7,178 made fresh for a constant
+buffer view, 198,364 slots**; 392 past the title slots the host mirrors (1,474 slots: NVIDIA's cap
+is not the cause); and **830 tables over 64 slots long hold 145,612 slots, 73%** (175 each). A
+table costs its highest offset plus one, holes included, so the long ones are mostly holes. The
+fix is less demand, not a better allocator: share a table made by several lists in a frame, or
+lay out tables with constant buffer views compactly (they are always made fresh, so their layout
+is ours; the translated shaders read descriptors as loads at fixed offsets from the table's
+index, `lower.rs` ~3022, so the translator would renumber those offsets).
+
+**Runs 28-32 (02:00-02:40): what serves the slots now, and what did not work.**
+- Run 28 logged which offsets the long tables' readers name: 60 kinds read 1,187 of their 9,182
+  slots (13%; a table of 101 slots read at its 101st alone). Tables made by another list in the
+  same frame are few (sharing them would save little).
+- Run 29 tried **sparse tables** (`descriptor/slab.rs` `Sparse`, `VICTORY_SPARSE_TABLES=1`, now off
+  by default): a long table takes slots at the offsets it reads alone, its holes on other tables'.
+  The world came out corrupt everywhere (striped and noisy surfaces): **some shaders read table
+  slots past the entries their programs list**, which then held other tables' views. Compact
+  tables in the translator would break the same way. Two thirds of the long tables found no place
+  anyway (90-135 ms of searching).
+- The allocator, compared in the same stretch of play (refused share of tables a frame):
+  the old ring 16.8% (run 23), size classes 27.8% (run 25: rounding and pages held by a class),
+  best fit 23.0% (run 30: 51,810 slots free in 7,718 crumbs, the longest 102), **next fit over
+  free stretches 16.5-16.7%** (runs 31-32), the ring's share without its 149 ms: a table that no
+  stretch holds is refused at once (an index by length), and the walk from the cursor stops after
+  64 stretches for the shortest that holds it. That is `descriptor/slab.rs` `Extents`, in use.
+  Tables come and go in about the order of a frame, so placing them in that order keeps what is
+  given back in long stretches; nothing placed better.
+- So the allocator is not the lever: a frame's tables need more than the 262,144 slots. The next
+  step (in progress): constant buffer views out of the tables. A table is made fresh only because
+  it holds one; if the translator reads a table's constant buffer views at heap indices the host
+  gives it (a host word per view, `USER_CBV_INDEX`), the rest of the table stays on the title's
+  own slots, holes and all, and a long table costs one or two slots instead of 175.
+
+**What the refusals look like on screen (run 26, `VICTORY_CAPTURE_WORLD`).** The presented frames
+every 8th frame show, walking from the cell to the yard: a rectangle of an older picture over the
+new one (frames 5075-5123 of that run), the "jumps to frames a second or two old" seen in play;
+and from 5315 on a blur with hard bands that thickens frame by frame and does not recover, the
+"0/20 vision". The first is what a tiled pass leaves when some of its tiles' draws are refused;
+the second a temporal pass feeding on its own output after a bad input. The cell's frames before
+it (1200 frames into the world) are sharp.
+
 ## How to run
 
 ```powershell

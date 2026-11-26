@@ -155,24 +155,13 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
-    /// How many dynamic slots are free (changed under `next`'s lock): with
-    /// fewer than a table needs, the search is not made. Once the world
-    /// had taken them all, every later table of the frame searched every
-    /// slot before it was refused.
-    free: std::sync::atomic::AtomicU32,
-    /// The shortest table that found no run of free slots since slots were
-    /// last given back (changed under `next`'s lock; `u32::MAX`: none).
-    /// Until something is given back the free runs only shrink, so a table
-    /// of that length or longer is refused without the search. Enough
-    /// slots were free, but in pieces, and every such table walked the
-    /// whole ring before it was refused: 0.33 ms each with 131,072 slots,
-    /// 1.0 s of the recording threads in a frame that refused 3,143 (run
-    /// 45), under the lock all of them need. (A free run that lies across
-    /// the place the search starts from is seen by neither.)
-    too_long: std::sync::atomic::AtomicU32,
+    /// The dynamic slots' free stretches, best fit (`super::slab::Extents`;
+    /// what came before it and how it did is told there).
+    runs: Mutex<super::slab::Extents>,
+    /// The last part of the dynamic slots, for long tables, placed by the
+    /// offsets they read (`super::slab::Sparse`), and where it starts.
+    sparse: Mutex<super::slab::Sparse>,
+    sparse_from: u32,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -1252,7 +1241,12 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let at = index - host.count;
+            let taken = if at >= host.sparse_from {
+                host.sparse.lock().unwrap_or_else(|e| e.into_inner()).holds(at - host.sparse_from)
+            } else {
+                host.runs.lock().unwrap_or_else(|e| e.into_inner()).holds(at)
+            };
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1421,6 +1415,38 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// sets the most). 2^18 ran out in the title's bigger places (session
 /// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
 /// refused, with 2,639 indirect draws and dispatches).
+/// Flag on a table's length, as a list keeps it to give the table back: a
+/// sparse table's ([`HostHeap::dynamic_sparse`]).
+pub(crate) const SPARSE: u32 = 1 << 31;
+
+/// Whether long tables take only the slots their readers name
+/// (`VICTORY_SPARSE_TABLES=1`; off by default). Run 29 with it on: the world
+/// corrupt at large (surfaces with others' views: some shaders read table
+/// slots past the entries their programs list, which here are other tables'),
+/// two thirds of the long tables found no place among the zone's free slots
+/// (a table reading 20-50 offsets rarely finds them all free), each such
+/// search a pass over the zone (90-135 ms a frame), and the slab a quarter
+/// smaller refused as many as before.
+pub(crate) fn sparse_tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SPARSE_TABLES"))
+}
+
+/// The slots of the dynamic area kept for sparse tables, whole pages: a
+/// quarter (`VICTORY_SPARSE_ZONE`, the fraction's denominator), none with
+/// them off. Run 27: the long tables were 73% of the slots asked for, and
+/// their reads 13% of their slots.
+fn sparse_zone(extra: u32) -> u32 {
+    if !sparse_tables() || extra < 4 * super::slab::PAGE {
+        return 0;
+    }
+    static PART: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let part = *PART.get_or_init(|| {
+        std::env::var("VICTORY_SPARSE_ZONE").ok().and_then(|v| v.trim().parse().ok()).filter(|&p| p >= 2).unwrap_or(4)
+    });
+    extra / part / super::slab::PAGE * super::slab::PAGE
+}
+
 fn dynamic_slots(count: u32, null: u32) -> u32 {
     static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
@@ -1542,9 +1568,9 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
-            free: std::sync::atomic::AtomicU32::new(extra),
-            too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+            runs: Mutex::new(super::slab::Extents::new(extra - sparse_zone(extra))),
+            sparse: Mutex::new(super::slab::Sparse::new(sparse_zone(extra))),
+            sparse_from: extra - sparse_zone(extra),
             strides,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
@@ -1657,52 +1683,51 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
-            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-        let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
-        let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
-            if enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
-            }
+        let first = self.runs.lock().unwrap_or_else(|e| e.into_inner()).take(n);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+        let Some(first) = first else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::DynamicRefused, 1);
-                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
-            }
+            crate::copystat::add(crate::copystat::C::DynamicRefused, 1);
             return None;
         };
+        Some(self.count + first)
+    }
+
+    /// A long table's slots, only those at the offsets `reads` (sorted,
+    /// distinct) names: the index of the table's start, which may lie on
+    /// slots of others (its holes are never read). The length a list keeps
+    /// for it to give back is flagged [`SPARSE`].
+    pub(crate) fn dynamic_sparse(&self, reads: &[u32]) -> Option<u32> {
+        if self.sampler || reads.is_empty() {
+            return None;
+        }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % end) as u32;
-        Some(self.count + first as u32)
+        let started = std::time::Instant::now();
+        let start = self.sparse.lock().unwrap_or_else(|e| e.into_inner()).take(reads);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+            add(C::SparseAsked, 1);
+            if start.is_none() {
+                add(C::SparseRefused, 1);
+            }
+        }
+        // Zone slot = start - BELOW + offset; heap index = count +
+        // sparse_from + zone slot.
+        Some(self.count + self.sparse_from + start? - super::slab::BELOW)
+    }
+
+    /// For the log: the dynamic slots free now, in how many free stretches,
+    /// and the longest; and the sparse zone's free slots of its size.
+    pub(crate) fn dynamic_census(&self) -> (u32, u32, u32, (u32, u32)) {
+        let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        let (stretches, longest) = runs.census();
+        let sparse = self.sparse.lock().unwrap_or_else(|e| e.into_inner());
+        (runs.free_slots(), stretches, longest, (sparse.free_slots(), sparse.slots()))
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -2528,17 +2553,16 @@ impl HostHeap {
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
+        if n & SPARSE != 0 {
+            if let Some(start) = (first + super::slab::BELOW).checked_sub(self.count + self.sparse_from) {
+                self.sparse.lock().unwrap_or_else(|e| e.into_inner()).give(start);
+            }
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
-            self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
-            self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
-        }
+        self.runs.lock().unwrap_or_else(|e| e.into_inner()).give(at, n);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -5408,41 +5432,68 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let a = heap.dynamic(heap.dynamic - 100).unwrap();
+        // Indices past the title's slots, one table after the other.
+        let a = heap.dynamic(60).unwrap();
         let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
-        // 40 left at the end: 50 do not fit until something is given back.
-        assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
-        assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+        assert_eq!((a, b), (4, 4 + 60));
+        heap.release(a, 60);
+        assert_eq!(heap.dynamic(60), Some(4 + 120), "past the last placed");
+        assert_eq!(heap.dynamic_census().0, heap.sparse_from - 120);
     }
 
+    /// The ring's failure (run 22: 2,083 tables a frame refused with slots
+    /// enough free, in pieces): tables given back serve tables again, every
+    /// one, however the rest of the heap is held.
     #[test]
-    fn dynamic_search_can_find_a_run_across_the_cursor() {
+    fn dynamic_slots_in_pieces_still_serve_tables() {
         let Some(heap) = HostHeap::new(false, 4) else {
             eprintln!("no host descriptor heap; skipped");
             return;
         };
-        let first = heap.dynamic(1).unwrap();
-        let left = heap.dynamic(2).unwrap();
-        let right = heap.dynamic(2).unwrap();
-        let rest = heap.dynamic(heap.dynamic - 5).unwrap();
-        assert_eq!((first, left, right, rest), (4, 5, 7, 9));
-
-        // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
-        assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
-        assert_eq!(heap.dynamic(4), Some(left));
+        let mut held = Vec::new();
+        while let Some(first) = heap.dynamic(16) {
+            held.push(first);
+        }
+        // (The sparse zone, when on, is the rest.)
+        assert_eq!(held.len() as u32, heap.sparse_from / 16);
         assert_eq!(heap.dynamic(1), None);
+        // Every other run back: half the slots, none of them in a run of 32.
+        for &first in held.iter().step_by(2) {
+            heap.release(first, 16);
+        }
+        assert_eq!(heap.dynamic(300), None, "no stretch is long enough");
+        let mut again = 0;
+        while heap.dynamic(16).is_some() {
+            again += 1;
+        }
+        assert_eq!(again, held.len() / 2, "every run given back served a table");
+        for &first in &held {
+            heap.release(first, 16);
+        }
+        // Then the stretches are one again and serve anything.
+        assert!(heap.dynamic(300).is_some());
+        assert_eq!(heap.dynamic_census().0, heap.sparse_from - 300);
+    }
 
-        // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
-        let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
-        assert_eq!(heap.dynamic(2), None);
+    /// A long table placed sparse: its start plus each offset it reads is a
+    /// slot of the zone, inside the heap; given back by its flagged length.
+    #[test]
+    fn sparse_tables_land_in_the_zone_and_come_back() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        if heap.sparse_from == heap.dynamic {
+            return; // sparse tables off
+        }
+        let reads = [41, 56, 99, 101];
+        let first = heap.dynamic_sparse(&reads).unwrap();
+        let zone = heap.count + heap.sparse_from..heap.count + heap.dynamic;
+        assert!(reads.iter().all(|k| zone.contains(&(first + k))), "{first}");
+        let (_, _, _, (free, size)) = heap.dynamic_census();
+        assert_eq!(free, size - 4);
+        heap.release(first, 102 | SPARSE);
+        assert_eq!(heap.dynamic_census().3 .0, size);
     }
 }
 

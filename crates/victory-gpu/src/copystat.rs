@@ -52,6 +52,24 @@ pub(crate) enum C {
     DynamicAsked,
     DynamicRefused,
     DynamicNs,
+    /// New tables asked for (not found made already in the list), and
+    /// their slots: those made afresh for a constant buffer view among
+    /// them; those lying past the title's slots the host heap mirrors
+    /// (NVIDIA's cap of 1,000,000 views); and of either, those of more than
+    /// 64 slots.
+    DynamicCbvTables,
+    DynamicCbvSlots,
+    DynamicPastTables,
+    DynamicPastSlots,
+    DynamicLongTables,
+    DynamicLongSlots,
+    /// Of the new tables, those not made already by another list in the
+    /// frame (the same title table, length and records), and their slots.
+    DynamicDistinctTables,
+    DynamicDistinctSlots,
+    /// Long tables placed by the offsets they read: asked, refused.
+    SparseAsked,
+    SparseRefused,
     /// Marker texts for device-removed data (`HostList::note`).
     NoteNs,
     /// Ranges given to shaders (steps), their snapshots, and the bytes
@@ -130,7 +148,7 @@ pub(crate) enum C {
     WaitsForBuffers,
     IndirectBounded,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 88;
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
 /// every list call (what counts here is summed up for the log alone).
@@ -1211,6 +1229,32 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
     );
+    tracing::info!(
+        "new tables per frame, why fresh: for a constant buffer view {:.0} tables {:.0} slots; past the \
+         title slots the host mirrors {:.0} tables {:.0} slots; of them over 64 slots long {:.0} tables \
+         {:.0} slots; not made by another list in the frame {:.0} tables {:.0} slots",
+        c[C::DynamicCbvTables as usize],
+        c[C::DynamicCbvSlots as usize],
+        c[C::DynamicPastTables as usize],
+        c[C::DynamicPastSlots as usize],
+        c[C::DynamicLongTables as usize],
+        c[C::DynamicLongSlots as usize],
+        c[C::DynamicDistinctTables as usize],
+        c[C::DynamicDistinctSlots as usize],
+    );
+    // The dynamic slots now, by size class: the free runs in pages carved for
+    // each (a class with many free and another refused is a class to split).
+    tracing::info!(
+        "sparse tables per frame (VICTORY_SPARSE_TABLES): {:.0} placed by the offsets they read, {:.0} found no place (made whole instead)",
+        c[C::SparseAsked as usize] - c[C::SparseRefused as usize],
+        c[C::SparseRefused as usize],
+    );
+    if let Some((free, stretches, longest, (sparse_free, sparse))) = crate::descriptor::with_view_heap(|heap| heap.dynamic_census()) {
+        tracing::info!(
+            "dynamic slots now: {free} free in {stretches} stretches, the longest {longest}; the sparse zone (VICTORY_SPARSE_TABLES): \
+             {sparse_free} of {sparse} slots free"
+        );
+    }
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(
