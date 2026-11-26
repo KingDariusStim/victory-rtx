@@ -46,15 +46,45 @@ pub(crate) fn in_place_on() -> bool {
     on() && crate::toggled!("VICTORY_PORT_CBV_PLACE")
 }
 
+/// Whether the host has no raw twins (view heaps of a million views: NVIDIA)
+/// and shaders read constant buffers as raw bytes from the slot itself
+/// (`victory_shader::emit::constants_raw_in_slot`): every constant buffer's
+/// slot is then made a raw view of its bytes.
+pub(crate) fn in_slot() -> bool {
+    victory_shader::emit::constants_raw_in_slot()
+}
+
+/// Whether a table's constant buffer that lies in a copy of a title buffer
+/// (in the card's memory, or the PC's) is read by the card out of the copy
+/// (on with the port; `VICTORY_PORT_CBV_COPY=0`: copied into upload memory
+/// at submission, as before). The copy's range is refreshed for the
+/// submission as a buffer view's would be, so the card reads what the
+/// title's CPU wrote before it submitted, and what a copy at its place in
+/// the list or a shader wrote there it reads after them, in the list's
+/// order: no fill of upload memory stands for the flights that wrote it.
+/// Added 2026-11-26 for the 8 GB card, where the title's 174 MB heap is a
+/// copy on the card and one such fill a frame waited 60-80 ms (run
+/// 163055).
+pub(crate) fn copy_on() -> bool {
+    on() && crate::toggled!("VICTORY_PORT_CBV_COPY")
+}
+
 /// Since the last line: tables' constant buffers given in place, their bytes;
 /// copied as before because not in place, because not on 16 bytes; title
-/// slots' constant buffers whose twin is a raw view.
-static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// slots' constant buffers whose twin is a raw view; read out of a copy,
+/// their bytes.
+static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// A table's constant buffer of `size` bytes was given in place.
 pub(crate) fn in_place(size: u32) {
     STATS[0].fetch_add(1, Relaxed);
     STATS[1].fetch_add(u64::from(size), Relaxed);
+}
+
+/// A table's constant buffer of `size` bytes is read out of a copy.
+pub(crate) fn from_copy(size: u32) {
+    STATS[5].fetch_add(1, Relaxed);
+    STATS[6].fetch_add(u64::from(size), Relaxed);
 }
 
 /// A table's constant buffer was copied as before: `aligned` false when it
@@ -82,9 +112,12 @@ pub(crate) fn log(frames: f64) {
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames.max(1e-9)).collect();
     tracing::info!(
         "renderer port 5 (VICTORY_PORT_CBV=1) per frame: {:.0} tables' constant buffers read by the card in place ({:.1} KB not copied, \
-         no step at submission); copied as before: {:.0} not in place, {:.0} not on 16 bytes; {:.0} title slots' constant buffers with a raw twin",
+         no step at submission), {:.0} out of a copy ({:.1} KB, VICTORY_PORT_CBV_COPY); copied as before: {:.0} not in place, {:.0} not on 16 bytes; \
+         {:.0} title slots' constant buffers with a raw twin",
         s[0],
         s[1] / 1024.0,
+        s[5],
+        s[6] / 1024.0,
         s[2],
         s[3],
         s[4],

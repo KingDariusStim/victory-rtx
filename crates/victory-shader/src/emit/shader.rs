@@ -228,6 +228,14 @@ pub fn constants_raw() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// Renderer port 5 on a host without raw twins ([`raw_views`] 0: view heaps of a million
+/// views, NVIDIA): a table's or a picked constant buffer is read as raw bytes from its slot
+/// itself, so the host makes every constant buffer's slot (a dynamic one, or a title slot's
+/// mirror) a raw view of its bytes, not a constant buffer view. Added 2026-11-26.
+pub fn constants_raw_in_slot() -> bool {
+    constants_raw() && raw_views() == 0
+}
+
 /// See [`RAW_VIEWS`]: where shaders translated now read the buffers they pick (0: in place).
 pub fn raw_views() -> u32 {
     #[cfg(test)]

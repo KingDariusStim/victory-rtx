@@ -7409,9 +7409,10 @@ impl<'a> Lower<'a> {
             }
             return Ok(None);
         }
-        if super::shader::raw_views() == 0 {
-            return Ok(None);
-        }
+        // Without raw twins (a host whose view heaps hold a million views,
+        // NVIDIA: `raw_views` is 0) the slot itself is read as raw bytes,
+        // and the host makes every constant buffer's slot a raw view
+        // (`constants_raw_in_slot`).
         let x = self.x;
         let scalar = &self.scalar;
         let through_heap = src.leaves().iter().all(|leaf| match leaf {

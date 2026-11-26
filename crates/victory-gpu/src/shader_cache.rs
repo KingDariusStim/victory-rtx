@@ -137,6 +137,11 @@ fn build() -> [u8; 32] {
         // their key.
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
+            // Without raw twins the slot itself is read raw: another
+            // translation.
+            if victory_shader::emit::constants_raw_in_slot() {
+                bytes.extend_from_slice(b" in slot");
+            }
         }
         bytes
     });

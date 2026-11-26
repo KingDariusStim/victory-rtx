@@ -3509,15 +3509,35 @@ impl State {
                     Some(View::Constant(address, size)) => {
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
-                        if crate::port_cbv::in_place_on() {
-                            match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
-                                Some(shadow) => {
+                        // And (`VICTORY_PORT_CBV_COPY`, on with the port) a
+                        // constant buffer in a copy of a title buffer is
+                        // read out of the copy, which the submission's
+                        // refresh brings up to date as for any buffer view:
+                        // what a copy at its place in the list or a shader
+                        // wrote there is read after it, on the card, where
+                        // a fill of upload memory stood 60-80 ms a frame
+                        // for the flights that wrote it (the title's ring
+                        // of constants in the 174 MB heap, run 163055).
+                        if crate::port_cbv::in_place_on() || crate::port_cbv::copy_on() {
+                            match crate::shadow::find(address, u64::from(size)) {
+                                Some(shadow) if shadow.in_place() && crate::port_cbv::in_place_on() => {
                                     if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
                                         crate::port_cbv::in_place(size);
                                         continue;
                                     }
                                     crate::port_cbv::copied(false);
                                 }
+                                Some(shadow) if !shadow.in_place() && crate::port_cbv::copy_on() => {
+                                    if crate::port_cbv::raw_ok(shadow.gpu(address)) {
+                                        shadow.refresh(list, address, u64::from(size));
+                                        if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                                            crate::port_cbv::from_copy(size);
+                                            continue;
+                                        }
+                                    }
+                                    crate::port_cbv::copied(false);
+                                }
+                                Some(_) => crate::port_cbv::copied(false),
                                 None => crate::port_cbv::copied(true),
                             }
                         }
