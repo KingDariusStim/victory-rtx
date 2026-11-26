@@ -843,11 +843,53 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let began = std::time::Instant::now();
+    STAGES.with(|s| s.set([0; 4]));
+    let out = writes_timed(start, end, guarded);
+    let took = began.elapsed();
+    // An asking that held its thread long: where (the intro's 1.27 s frame,
+    // run 43, was 104 ms a frame of "asking the write watch").
+    if took >= std::time::Duration::from_millis(100) {
+        let [journal_ms, hold_ms, kernel_ms, guard_ms] = STAGES.with(|s| s.get()).map(|us| us / 1000);
+        tracing::info!(
+            ms = took.as_millis() as u64,
+            journal_ms,
+            hold_ms,
+            kernel_ms,
+            guard_ms,
+            kb = (end - start) / 1024,
+            guarded,
+            "a slow asking of the write watch"
+        );
+    }
+    out
+}
+
+thread_local! {
+    /// [`writes`]' stages on this thread, µs: the journal's lock, waiting
+    /// for another asking of the range, the kernel, the guards.
+    static STAGES: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+/// `f`'s result, its time added to [`STAGES`]' place `i`.
+fn stage<T>(i: usize, f: impl FnOnce() -> T) -> T {
+    let began = std::time::Instant::now();
+    let out = f();
+    let us = began.elapsed().as_micros() as u64;
+    STAGES.with(|s| {
+        let mut all = s.get();
+        all[i] += us;
+        s.set(all);
+    });
+    out
+}
+
+fn writes_timed(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
     let ahead = |j: &Journal| j.ahead.holds(first, last).then(|| (j.ahead_asked, of(j)));
-    if let Some(known) = ahead(&journal()) {
+    if let Some(known) = ahead(&stage(0, journal)) {
         return Some(known);
     }
     // Read-only since an asking noted it: the bits first, then the journal.
@@ -857,19 +899,19 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             tally(2, 1);
             crate::faultbook::note(crate::faultbook::What::Known, first, last, 0);
         }
-        let j = journal();
+        let j = stage(0, journal);
         return Some((next_asking(), of(&j)));
     }
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
-    let _range = Asking::hold(first, last);
-    if let Some(known) = ahead(&journal()) {
+    let _range = stage(1, || Asking::hold(first, last));
+    if let Some(known) = ahead(&stage(0, journal)) {
         return Some(known);
     }
     let mut guards_asked = false;
     // (View memory read-only by our hand: the kernel would refuse.)
     let refused = guarded && light() && PROTECTED.any(first, last);
-    let pages = match if refused { None } else { kernel_written(first, last) } {
+    let pages = match if refused { None } else { stage(2, || kernel_written(first, last)) } {
         Some(pages) => pages,
         None => {
             guards_asked = true;
@@ -878,7 +920,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             }
             #[cfg(feature = "diagnostics")]
             let guarding = std::time::Instant::now();
-            let written = guard(first * PAGE, last * PAGE).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
+            let written = stage(3, || guard(first * PAGE, last * PAGE)).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -895,11 +937,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     };
     if pages.is_empty() {
         // Nothing to note: the others may go on reading.
-        let j = journal();
+        let j = stage(0, journal);
         return Some((next_asking(), of(&j)));
     }
     let answer = {
-        let mut j = journal_mut();
+        let mut j = stage(0, journal_mut);
         let now = next_asking();
         for &(page, parts) in &pages {
             j.note(page, parts, now);

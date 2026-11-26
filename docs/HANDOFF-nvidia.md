@@ -398,8 +398,40 @@ pipeline book warm) is the baseline for both targets.
 
 ### Target 1: the stutter in the intro animation, about 10 s after A is first pressed
 
-What the user sees: right after the first A press the intro animation stutters for about ten
-seconds, then runs smoothly. What run 40 shows so far:
+**Fixed in the tree after 72a6d2f (runs 41-50, 2026-11-26); the user has yet to confirm by eye.**
+What it was, and how it was found:
+
+- New per-frame log (`victory_gpu::frame`): `frame intervals: longest N ms, K over 40 ms` every
+  second, `frame hitch N ms` for any present interval over 50 ms, and `button A pressed` /
+  `button Menu pressed` (`victory_hle::input`) from the pad poll, so a hitch can be lined up with
+  the press. `VICTORY_KEYS=14:Enter` presses A at a fixed time for a run that repeats.
+- A screen sampler beside it (a 256x256 patch of the window hashed as fast as the desktop gives
+  it, ~60 a second) counts how long each distinct image stays up: that is what the eye sees,
+  and it agrees with the frame log.
+- **It was not pipelines.** Every run after `-Mode warm` makes none (`host pipelines all made
+  made=0 loaded=…`): the `host pipeline shaders=` lines are library loads, and the frame line's
+  "waiting for pipelines" is 0.0 ms through the intro. The counts in run 40 were a red herring.
+- **It was thread starvation.** The timeline (`VICTORY_TIMELINE=14.5,60,<file>`) showed the
+  long frames as "woken, not running yet": the submitting thread had asked `victory-heap-sync`
+  for its round and notified it, and that thread got no processor for 80 ms to 1.3 s. At that
+  moment the title's job threads burst over all 12 processors: with `-Fast`
+  (`VICTORY_TITLE_PRIORITIES=0`) they run as the title set them, 6 at "time critical" and 13 at
+  "highest", while our frame-critical threads ran at "normal".
+- The fix (`cores.rs`, `raise`): the threads a frame waits for (`victory-submit`, `-relay`,
+  `-late-wait`, `-heap-sync`: those that call `keep_on_fast_cores`) run at "time critical"
+  (`VICTORY_LANE_PRIORITY=2`, the default; `1`: "highest", which still lost 75 ms behind the
+  title's time-critical threads; `0`: as before). They run for microseconds between waits, so
+  the title loses nothing measurable.
+- Before: longest present interval in the 15 s after the press 0.4-1.3 s, 7-16 screen holds
+  over 50 ms per 25 s. After: longest 59 ms once, else under 50 ms; the only hitch left in every
+  run is 68 ms at +15.8 s, and the timeline shows it is the title's own `Sleep` of 56 ms on its
+  render thread (content-driven: the same instant in every run).
+- Also added: `VICTORY_VSYNC=1` → `Present(1, 0)` (not needed for this; left for the once-a-second
+  refresh hitch of open problem 7), and a `slow asking of the write watch` line with a breakdown
+  (journal, hold, kernel, guards) for any `watch::writes` over 100 ms.
+
+The original analysis, kept for the record. What the user sees: right after the first A press
+the intro animation stutters for about ten seconds, then runs smoothly. What run 40 showed:
 
 - The 5-second frame meter (`victory_gpu::host: N fps`) reads a flat 30.0 fps from 15:09:41 to
   15:10:11, so the meter's averages hide it. **First step: a per-frame measure.** Log each

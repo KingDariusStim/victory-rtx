@@ -8669,6 +8669,13 @@ struct Presenter {
     panel: panel::Panel,
 }
 
+/// The sync interval of the host's Present: 0 (no wait for the display,
+/// the default) unless `VICTORY_VSYNC=1`, which waits for one refresh.
+fn vsync() -> u32 {
+    static ON: OnceLock<u32> = OnceLock::new();
+    *ON.get_or_init(|| u32::from(std::env::var("VICTORY_VSYNC").as_deref() == Ok("1")))
+}
+
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 /// Makes the frame meter's lines of every 5 s: on a thread of ours
@@ -8717,6 +8724,11 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
+    /// The last present, and this second's longest interval and count of
+    /// intervals over 40 ms: the 1 s and 5 s averages hide single hitches.
+    last: std::time::Instant,
+    longest: std::time::Duration,
+    over_40: u32,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -8731,6 +8743,9 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            last: now,
+            longest: std::time::Duration::ZERO,
+            over_40: 0,
             caption: None,
         }
     }
@@ -8748,6 +8763,19 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        let now = std::time::Instant::now();
+        let interval = now - std::mem::replace(&mut self.last, now);
+        self.longest = self.longest.max(interval);
+        if interval > std::time::Duration::from_millis(40) {
+            self.over_40 += 1;
+            if interval > std::time::Duration::from_millis(50) {
+                tracing::info!(
+                    target: "victory_gpu::frame",
+                    "frame hitch {:.1} ms",
+                    interval.as_secs_f64() * 1000.0
+                );
+            }
+        }
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -8762,6 +8790,13 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        tracing::info!(
+            target: "victory_gpu::frame",
+            "frame intervals: longest {:.1} ms, {} over 40 ms, {} frames",
+            std::mem::take(&mut self.longest).as_secs_f64() * 1000.0,
+            std::mem::take(&mut self.over_40),
+            frames
+        );
         // The lines (every second, and more every 5 s: sorting, system
         // calls, some forty lines written) are made by a thread of ours
         // ([`meter_lines`]), not by the presenting thread, the lane: about
@@ -9205,7 +9240,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let _ = p.swap_chain.Present(vsync(), DXGI_PRESENT(0));
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());

@@ -114,7 +114,34 @@ fn stage() -> u32 {
 /// processors is a preference the scheduler keeps unless nothing of it is
 /// free.) The title's threads are not asked for.
 pub(crate) fn keep_on_fast_cores(what: &str) {
+    raise(what);
     ask(what, 1);
+}
+
+/// Runs the calling thread, one a frame waits for, at "time critical"
+/// priority (`VICTORY_LANE_PRIORITY`: 2, the default; 1: "highest"; 0: as
+/// before, "normal"). The title's job threads run at "highest" (13 of them)
+/// and "time critical" (6), and in the intro they burst over every
+/// processor at once: the heap-sync thread, at "normal", then got no
+/// processor for 80 ms to 1.3 s while the submitting thread waited for its
+/// round, and the screen held one frame that long (runs 41-47, the stutter
+/// after the first A press); at "highest" it still waited 75 ms behind
+/// them (run 48). These threads run for microseconds at a time between
+/// waits: the title's threads lose next to nothing to them.
+fn raise(what: &str) {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    static LEVEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let level = *LEVEL.get_or_init(|| std::env::var("VICTORY_LANE_PRIORITY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2));
+    let priority = match level {
+        0 => return,
+        1 => THREAD_PRIORITY_HIGHEST,
+        _ => THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    // SAFETY: our own thread.
+    let ok = unsafe { SetThreadPriority(GetCurrentThread(), priority) } != 0;
+    tracing::info!(what, level, ok, "the thread runs at a raised priority (VICTORY_LANE_PRIORITY=0: not)");
 }
 
 /// [`keep_on_fast_cores`] for one of the threads a submission's preparing or

@@ -428,6 +428,27 @@ impl Hub {
         lock(&self.state)
     }
 
+    /// Logs A (a pad's A, or Enter, its keyboard stand-in) and Menu going
+    /// down, so a hitch in the frame log can be put next to the press.
+    fn log_presses(pads: &[Option<PadState>; PADS], keys: &[KeyState]) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static HELD: AtomicU32 = AtomicU32::new(0);
+        let mut now = pads.iter().flatten().fold(0, |all, p| all | p.buttons) & (A | MENU);
+        if keys.iter().any(|k| k.virtual_key == 0x0D) {
+            now |= A;
+        }
+        if keys.iter().any(|k| k.virtual_key == 0x1B) {
+            now |= MENU;
+        }
+        let went_down = now & !HELD.swap(now, Ordering::Relaxed);
+        if went_down & A != 0 {
+            tracing::info!(target: "victory_hle::input", "button A pressed");
+        }
+        if went_down & MENU != 0 {
+            tracing::info!(target: "victory_hle::input", "button Menu pressed");
+        }
+    }
+
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
         let (pads, keys) = {
@@ -435,6 +456,7 @@ impl Hub {
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             (pads, source.keys())
         };
+        Self::log_presses(&pads, &keys);
         let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
         self.deliver(events);
     }
