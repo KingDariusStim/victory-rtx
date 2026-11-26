@@ -777,6 +777,53 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
+/// The debug layer's callback: corruption, errors and warnings logged (with
+/// `D3D12:` as `log_messages` does), each message ID its first three times and
+/// then at every power of ten with its count, so a message repeated every
+/// draw does not drown the log.
+unsafe extern "system" fn debug_message(
+    _category: D3D12_MESSAGE_CATEGORY,
+    severity: D3D12_MESSAGE_SEVERITY,
+    id: D3D12_MESSAGE_ID,
+    description: windows::core::PCSTR,
+    _context: *mut std::ffi::c_void,
+) {
+    if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
+        return;
+    }
+    static SEEN: OnceLock<Mutex<std::collections::HashMap<i32, u64>>> = OnceLock::new();
+    let n = {
+        let mut seen = SEEN.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner());
+        let n = seen.entry(id.0).or_insert(0);
+        *n += 1;
+        *n
+    };
+    let power_of_ten = {
+        let mut p = 10u64;
+        while p < n {
+            p = p.saturating_mul(10);
+        }
+        p == n
+    };
+    if n > 3 && !power_of_ten {
+        return;
+    }
+    let text = if description.is_null() {
+        String::new()
+    } else {
+        // SAFETY: the debug layer passes a NUL-terminated string for the call.
+        unsafe { description.to_string() }.unwrap_or_default()
+    };
+    // (tests have no log subscriber: there the messages go to stderr)
+    #[cfg(test)]
+    eprintln!("D3D12 debug layer (severity {}, id {}, {n}x): {text}", severity.0, id.0);
+    if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+        tracing::error!(id = id.0, severity = severity.0, times = n, "D3D12: {text}");
+    } else {
+        tracing::warn!(id = id.0, severity = severity.0, times = n, "D3D12: {text}");
+    }
+}
+
 /// Ends the run on a host GPU failure: what failed, the removal reason and
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
@@ -928,6 +975,22 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
+        // The debug layer's errors and warnings logged as they come, not only
+        // read out when the device fails (`log_messages`): a run that goes on
+        // with wrong output says why. `VICTORY_D3D12_DEBUG_LIVE=0`: as before.
+        if debug
+            && std::env::var_os("VICTORY_D3D12_DEBUG_LIVE").is_none_or(|v| v != "0")
+            && let Ok(queue) = device.cast::<ID3D12InfoQueue1>()
+        {
+            let mut cookie = 0;
+            let made = queue.RegisterMessageCallback(
+                Some(debug_message),
+                D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                std::ptr::null_mut(),
+                &mut cookie,
+            );
+            tracing::info!(ok = made.is_ok(), "D3D12 debug messages logged as they come");
+        }
         let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
