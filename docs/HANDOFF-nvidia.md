@@ -269,8 +269,12 @@ given back when the list's submission has run (`tables_done`); a table that find
 refused and its draw dropped, after a search of the whole ring when enough slots are free but in
 pieces. So the lighting draws and some 2,000 other tables a frame go unmade. This is the likeliest
 single cause of the dark and wrong lighting here, and it costs 149 ms a frame of searching on top.
-The build after run 22 names the reason on each "prepare failed" (pipeline kind, index buffer, or
-binding), to confirm.
+Run 23, with the reason named on each "prepare failed": all of them **"binding failed"**, and most
+are **indirect mesh dispatches (kind 10)** of dozens of different mesh pipelines at 10 to 63 a
+frame each (`[mesh 7972997d15fd9e69, pixel 9f14b72117e2abec]` 63 a frame, `[mesh
+6016f52cd61f30f6]` 60, and so on), the tiled lighting's 256 among the rest. Mesh pipelines carry
+the longest tables, so they are the first refused a run. That is world geometry going undrawn
+every frame on this card, which the X and S profiles share alike.
 
 Two fixes, both more than an evening:
 1. **Compact tables**: have the translator lay out each pipeline's descriptor tables with only the

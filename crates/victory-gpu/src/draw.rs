@@ -3890,7 +3890,17 @@ impl State {
             _ => false,
         };
         if !ran {
-            why("prepare failed");
+            // Which way it failed: the pipeline is there (above), so it is
+            // the pipeline's kind against the record's, an index buffer in
+            // no title buffer, or the binding (roots, tables, targets).
+            let reason = if kind != DISPATCH && (p.compute || p.mesh != (kind == MESH)) {
+                "pipeline of another kind"
+            } else if kind == INDEXED && crate::shadow::find_any(self.index.address, u64::from(self.index.size)).is_none() {
+                "index buffer outside title buffers"
+            } else {
+                "binding failed"
+            };
+            why(&format!("prepare failed: {reason} [{}]", p.name));
             return false;
         }
         #[cfg(feature = "diagnostics")]
