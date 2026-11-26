@@ -1,3 +1,33 @@
+# victory-rtx (NVIDIA)
+
+> **Modified version.** This branch is a modified version of
+> [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX), itself a fork of
+> [fxceless/victory-fork](https://github.com/fxceless/victory-fork) and
+> [Marvisak/VIctory](https://github.com/Marvisak/VIctory), with work from DexNom, Belobug,
+> romainhedouin and the others named under Credits below. It is distributed under the same
+> license, GPL-3.0-or-later ([LICENSE](LICENSE)), with no warranty. The changes made here, from
+> 2026-11-25, target NVIDIA GPUs (tested on an RTX 2080 SUPER with a Ryzen 7 3700X) and are
+> recorded in the git history, each commit naming where it was ported from
+> ([KingDariusStim/victory-rtx](https://github.com/KingDariusStim/victory-rtx), branch `nvidia`):
+>
+> - copies between 16-bit colour textures (B5G5R5A1, B4G4R4A4) and the 8-bit stand-ins NVIDIA
+>   needs for them converted on the card (`crates/victory-gpu/src/standin.rs`), instead of
+>   skipped; the stand-ins and copies counted in the periodic report;
+> - D3D12 debug-layer messages logged as they happen (`VICTORY_D3D12_DEBUG_LIVE`);
+> - audio-decoder counters and failure logging (`crates/victory-hle/src/modules/apu.rs`);
+> - a Windows run kit with a log summarizer (`tools/runkit`), whose `-Fast` uses the settings
+>   of `scripts\play.ps1`.
+>
+> **No game content.** This repository contains no game files, code or assets, and none are
+> distributed: you need your own legally obtained copy, and everything is derived from it on your
+> own machine. See [docs/asset-policy.md](docs/asset-policy.md) for the one file outside this
+> license.
+>
+> **Not affiliated.** This project is not affiliated with, endorsed by or connected to the game's
+> developer or publisher, Microsoft or Xbox, AMD or NVIDIA. All trademarks belong to their owners.
+>
+> The README of avatarmanz/VIctory-7900XTX follows unchanged.
+
 # VIctory on an RX 7900 XTX
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
