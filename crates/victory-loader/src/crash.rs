@@ -654,6 +654,10 @@ fn unwind(context: CONTEXT) -> Vec<u64> {
 #[repr(C, align(16))]
 pub(crate) struct Aligned16(pub(crate) CONTEXT);
 
+/// The loaded images' address ranges, as the sampler last listed them
+/// (empty: not listed, and every program counter is looked up).
+pub(crate) static KNOWN_IMAGES: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
 /// [`unwind`] for any thread of the process, its stack being `low..high`;
 /// pushes no more than `MAX_FRAMES`, so it does not allocate when `frames`
 /// has that capacity (another thread may be suspended holding the heap).
@@ -664,6 +668,15 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
     let mut aligned = Aligned16(context);
     let context = &mut aligned.0;
     frames.push(context.Rip);
+    // The images' ranges, when the sampler gave them: a program counter
+    // outside every image has no unwind data of an image, and asking the
+    // system about it walks the dynamic function tables, where the title's
+    // entries have faulted (read of 0x10037 in `RtlLookupFunctionEntry`).
+    let known = KNOWN_IMAGES.try_lock().ok();
+    let in_an_image = |pc: u64| match known.as_deref() {
+        Some(ranges) if !ranges.is_empty() => ranges.iter().any(|&(from, to)| (from..to).contains(&pc)),
+        _ => true,
+    };
     while frames.len() < MAX_FRAMES {
         // Stop where reading the stack would fault inside this handler.
         let rsp = context.Rsp as usize;
@@ -672,7 +685,11 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
         }
         let mut image = 0;
         // SAFETY: looks up the function table entry covering `Rip`, if any.
-        let entry = unsafe { RtlLookupFunctionEntry(context.Rip, &mut image, null_mut()) };
+        let entry = if in_an_image(context.Rip) {
+            unsafe { RtlLookupFunctionEntry(context.Rip, &mut image, null_mut()) }
+        } else {
+            null_mut()
+        };
         if entry.is_null() {
             // SAFETY: `rsp` is inside this thread's stack.
             context.Rip = unsafe { (rsp as *const u64).read() };

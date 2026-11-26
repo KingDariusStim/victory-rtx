@@ -12,7 +12,8 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE, TH32CS_SNAPTHREAD,
+    THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, OpenThread, ResumeThread,
@@ -95,6 +96,35 @@ pub(crate) fn other_threads() -> Vec<u32> {
     // SAFETY: we opened it.
     unsafe { CloseHandle(snapshot) };
     ids
+}
+
+/// Lists the loaded images' address ranges for the unwinder
+/// ([`crate::crash::KNOWN_IMAGES`]): a program counter outside them all is
+/// not looked up in the system's function tables, where the title's dynamic
+/// entries have faulted the sampler. Called with no thread suspended.
+pub(crate) fn note_images() {
+    // SAFETY: a snapshot of this process's modules.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return;
+    }
+    let mut ranges = Vec::new();
+    // SAFETY: zeroed is a valid MODULEENTRY32W; its size is set before use.
+    let mut entry: MODULEENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = size_of::<MODULEENTRY32W>() as u32;
+    // SAFETY: `snapshot` is open; `entry` is sized.
+    let mut more = unsafe { Module32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        let from = entry.modBaseAddr as u64;
+        ranges.push((from, from + u64::from(entry.modBaseSize)));
+        // SAFETY: as above.
+        more = unsafe { Module32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: we opened it.
+    unsafe { CloseHandle(snapshot) };
+    if !ranges.is_empty() {
+        *crate::crash::KNOWN_IMAGES.lock().unwrap_or_else(|e| e.into_inner()) = ranges;
+    }
 }
 
 /// Prints every other thread's stack to stderr. Each thread is suspended

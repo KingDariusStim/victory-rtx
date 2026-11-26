@@ -112,6 +112,7 @@ fn profile((from, to, every, file): (Duration, Duration, Duration, String), star
 
 /// Opens the threads that are new, and chooses the ones to sample.
 fn choose(threads: &mut HashMap<u32, Thread>, chosen: &mut Vec<u32>) {
+    crate::stacks::note_images();
     for id in other_threads() {
         threads.entry(id).or_insert_with(|| {
             // SAFETY: opens a thread of our own process; kept open for the
