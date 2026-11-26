@@ -1182,6 +1182,9 @@ impl Staging {
         if alone && last.hash.is_some() {
             return 0;
         }
+        // What a copy left stale in this memory is landed first (the asking
+        // below then sees it written, `crate::lazy`).
+        crate::lazy::lift_for("texture", start, size);
         if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;

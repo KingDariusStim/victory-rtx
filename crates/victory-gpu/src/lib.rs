@@ -43,6 +43,8 @@ mod indirect;
 mod inplace;
 #[cfg(windows)]
 mod land;
+#[cfg(windows)]
+mod lazy;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -56,6 +58,8 @@ mod popwatch;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod readwatch;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod replay;
 pub mod resource;

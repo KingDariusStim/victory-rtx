@@ -3503,6 +3503,11 @@ fn relay_hand_back(back: &[Declared]) -> RelayBack {
         if shadow.carded() {
             continue;
         }
+        // Put off until something touches the title memory (`crate::lazy`;
+        // protecting only, the landing below goes on as before).
+        if shadow.lazy_back() && shadow.defer_back(declared) && !crate::lazy::protect_only() {
+            continue;
+        }
         let mut spans: Vec<(usize, usize)> = Vec::new();
         join_ranges(&mut spans, declared.iter().copied());
         for &(from, to) in &spans {
@@ -3664,6 +3669,7 @@ fn late_line(frames: f64) {
         }
     }
     crate::land::log(frames);
+    crate::lazy::log(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(

@@ -94,11 +94,9 @@ on top of `scripts\play.ps1`'s settings, plus `VICTORY_PIPELINE_BOOK=1`.
    frames: normal. Textures unused for seconds, and the biggest mip levels: low. Then Windows pages
    the right things out to system RAM when the card overruns. Needs a last-used frame per host
    texture and a pass that sets priorities now and then.
-3. **Lazy read-back** (the largest frame-rate lever left). Do not fetch every buffer shaders wrote
-   back into title memory each frame. Protect the title's copy, and fetch a page from the card only
-   when the title's CPU code touches it (a fault). Buffers the title never reads on the CPU (most:
-   lighting, particles, visibility) then cost nothing. The guard-and-fault machinery already exists
-   for the other direction (`crates/victory-gpu/src/watch.rs`).
+3. **Lazy read-back**: built, correct as far as runs 14-16 show, off by default, and not yet a
+   gain. See "The read census and the lazy read-back" below for what it found, what it does, where
+   it stands and what it needs next.
 4. **Retire buffers that stopped changing.** One that came back unchanged N frames running is no
    longer compared until new GPU work writes it. Smaller gain; easy.
 5. **Size the reserves from the budget in code**, not by environment: `targets_room_kept()`
@@ -116,6 +114,82 @@ on top of `scripts\play.ps1`'s settings, plus `VICTORY_PIPELINE_BOOK=1`.
 
 Done and ruled out: Resizable BAR (no official support on RTX 20 cards; only a firmware mod);
 a RAM disk as a cache (the copies are already RAM to RAM; the cost is waiting and comparing).
+
+## The read census and the lazy read-back (runs 6-16, 2026-11-25 evening)
+
+**The question.** After each submission the bytes shaders wrote go back into title memory before
+the title is told its work is done (`crates/victory-gpu/src/land.rs`): 35-40 MB a frame here. On the
+console the CPU reads some of that memory; on this PC the relay thread spent 30-36 ms a frame on
+it, and the submitting thread 15 ms more taking snapshots. How much of it does the title's CPU ever
+read?
+
+**The census** (`VICTORY_READ_WATCH=1`, diagnostics builds, `crates/victory-gpu/src/readwatch.rs`):
+in three windows of 40 frames, the 4 KiB pages a landing had just changed were made guard pages,
+and the first touch of each noted. Run 6: 875, 627 and 420 MB landed; the title's own code touched
+0.2 % of the pages; 98-99 % of the pages lay in copies the title never touched at all. One 94 MB card
+copy (0xd6b610000) was 75 % of the bytes; a 12.6 MB and two 6 MB copies in the PC's memory most of
+the rest. The relay's own breakdown: 26 ms a frame comparing PC-memory copies with their snapshots,
+13 waiting for card fetches, 8 merging; the snapshots 15 ms on the submitting thread. So the
+PC-memory copies cost more time than the card copy, and the lazy path was built for them first.
+
+**What it does** (`VICTORY_LAZY_BACK=1`, `crates/victory-gpu/src/lazy.rs`; hooks in `shadow.rs`,
+`watch.rs`, `host.rs`, `texture.rs`, `memory.rs`). A copy in the PC's memory of a title buffer in the
+title's own private memory, 256 KiB or more (`VICTORY_LAZY_MIN_KB`), with no other copy of any of
+its memory, does not compare or merge when its flight lands. Its declared ranges are noted stale,
+their pages made no-access, and the snapshot kept. The first touch of a stale page faults into the
+handler of `crate::watch`, which lands the piece's declared parts (copy against snapshot, as the
+eager landing would) and gives the pages back. A kernel write (file reads announce themselves with
+`kernel_writing`/`writing`), a free, a commit over the pages, or another copy's refresh of the same
+memory lands first. `=2` lands at once but keeps the protections (verifies the machinery), `=3`
+protects only and lands eagerly; `VICTORY_LAZY_TRACE=1` logs the first 2,000 events. The frame-rate
+line gets a "lazy read-back per frame" line.
+
+**What it cost to get right.** Runs 7-13 all died the same way, seconds to half a minute after the
+first deferred landings: the title's own null write at image+0x23cf683 on a worker thread. Three
+real bugs, in the order found:
+- a whole 64 KiB piece was compared against a snapshot that only holds the declared ranges, and the
+  copy's older bytes went over the title's own writes outside them (now only declared offsets are
+  compared and put: `Stale.ranges`);
+- `VirtualQuery` on the title's regions costs milliseconds a call (the tree knows this: `copy_mapped`);
+  one per protection was 100-200 ms a frame (now asked once per copy);
+- the one that crashed: when the first page of a run was already no-access (a neighbouring copy's
+  stale piece on a page both share), `protect()` refused the run, put that no-access on the whole run
+  and dropped the claim. A kernel write into such a page does not fault, it fails: DirectStorage's
+  read failed, its retries failed, and the title worked with the bytes from before. Found with the
+  trace in run 15; fixed in run 16's build, which then ran 10 minutes in the world (7-8 fps in the
+  prison yard, 3,700 draws, no warnings).
+Also found on the way: a landing's own writes called back into the landing on its own lock
+(a thread-local flag now); landing the whole range ahead of `merge_under_writes` landed every deferred
+piece within its frame (removed: the handler suffices there); 4-byte counters the title polls were
+being deferred (the size floor).
+
+**Where it stands.** Correct, and nearly no gain: in run 16's steady state 0.4 MB a frame deferred
+of 35-40 MB landed, copying back still 32-37 ms. Two reasons, both structural:
+1. The title's buffers overlap: a big heap has thousands of smaller buffers inside it, each with a
+   copy of its own. Another copy learns of the card's writes only from the eager landing's writes
+   into title memory (the kernel's dirty bits), and the host skips its refresh when nothing is
+   dirty. So a copy with another copy over any of its memory is kept eager (`Shadow::alone`): 12
+   landings a frame, among them the 6 MB copies.
+2. The 94 MB card copy (75 % of the bytes) is not covered: its pieces need a fetch from the card at
+   the touch (a fetch kit usable from any thread; the bookkeeping fits, see `relay_card_back`).
+
+**What it needs next, in order.**
+1. Let overlapped copies defer: when a copy defers pieces, mark their pages as written in the
+   watch's journal (`crate::watch::landed_beside` is the primitive for a write the kernel did not
+   see), so the overlapping copies' refreshes see dirt, read title memory, fault, and land the
+   deferring copy's piece. Overlapped ranges then land once a frame through the fault path (no gain
+   there), ranges nobody else holds stay deferred. Measure with the "lazy read-back per frame" line.
+2. Phase 2, the card copy: in `relay_card_back`, pieces of a deferring card copy are noted stale
+   instead of fetched; the touch fetches them (one `CopyBufferRegion` into a small staging buffer on
+   a list/fence of the handler's own, numbered after every send so far so `Card::sent` needs no older
+   notes) and merges with `land_card`.
+3. Only then judge the lever: the census says 98 % of landed bytes could go, the machinery says the
+   overlap structure decides how much of that is reachable.
+
+Run 6 also showed ~700 draws a frame dropped "without a host pipeline" against run 5's 5: new scene
+content, not a regression; `-Mode warm` after a run covers it. Runs 7-16 were driven unattended (a
+PowerShell driver pressed Enter with a held key, took screenshots and logged the frame rate; a
+`SendKeys` press is too short for the title to see).
 
 ## How to run
 

@@ -508,6 +508,8 @@ impl Memory {
             return;
         }
         let started = std::time::Instant::now();
+        // (What a copy left stale there is landed first: `crate::lazy`.)
+        crate::lazy::lift_for("arena", (first * PAGE) as usize, ((end - first) * PAGE) as usize);
         let answer = crate::watch::writes((first * PAGE) as usize, (end * PAGE) as usize, true);
         for page in first..end {
             let Some(held) = self.pages.get_mut(&page) else {

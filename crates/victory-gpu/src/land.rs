@@ -617,6 +617,9 @@ unsafe fn piece_at(
     let since = crate::watch::changes();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
     let mut span: Option<(usize, usize)> = None;
+    // The first and last 4 KiB page with a new byte (for the read watch).
+    #[cfg(feature = "diagnostics")]
+    let mut changed: Option<(usize, usize)> = None;
     for_pages(title, parts, |from, n| {
         pages += 1;
         if !differing[(title + from) / PAGE - base] {
@@ -649,6 +652,12 @@ unsafe fn piece_at(
         missing += u64::from(!done.there);
         if done.new > 0 {
             new_pages += 1;
+            #[cfg(feature = "diagnostics")]
+            {
+                let page = (title + from) / PAGE;
+                let c = changed.get_or_insert((page, page));
+                c.1 = page;
+            }
             if beside.is_some() {
                 let page = (title + from) / PAGE;
                 // (Two parts in one page.)
@@ -666,6 +675,10 @@ unsafe fn piece_at(
         // block then has two.
         let through = if missing == 0 { copy } else { std::ptr::null() };
         notes.landed.push((title / BLOCK, through));
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some((first, last)) = changed {
+        crate::readwatch::landed(copy, first * PAGE, (last + 1) * PAGE, beside.is_some());
     }
     count(stat::NEW_PIECES, u64::from(new_pages > 0));
     count(stat::PAGES, pages);

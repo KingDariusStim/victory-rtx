@@ -828,7 +828,7 @@ pub(crate) fn light() -> bool {
 
 /// A bit per block of the address space, in pieces made when first needed
 /// and never let go.
-struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
+pub(crate) struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
 
 /// The bits of 4 GiB.
 type BitsPiece = [std::sync::atomic::AtomicU64; Bits::WORDS];
@@ -838,7 +838,7 @@ impl Bits {
     /// 128 TiB, what a process has.
     const PIECES: usize = 1 << 15;
 
-    const fn new() -> Bits {
+    pub(crate) const fn new() -> Bits {
         Bits([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Bits::PIECES])
     }
 
@@ -848,7 +848,7 @@ impl Bits {
         unsafe { piece.as_ref() }
     }
 
-    fn set(&self, block: usize) {
+    pub(crate) fn set(&self, block: usize) {
         use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
         let word = block / 64;
         let Some(place) = self.0.get(word / Bits::WORDS) else {
@@ -881,7 +881,7 @@ impl Bits {
         }
     }
 
-    fn clear(&self, block: usize) {
+    pub(crate) fn clear(&self, block: usize) {
         let word = block / 64;
         if let Some(piece) = self.piece(word) {
             // Ahead of the protection's change, and seen by whoever the
@@ -891,7 +891,7 @@ impl Bits {
     }
 
     /// Whether a bit of `[first, last)` is set.
-    fn any(&self, first: usize, last: usize) -> bool {
+    pub(crate) fn any(&self, first: usize, last: usize) -> bool {
         let mut block = first;
         while block < last {
             let word = block / 64;
@@ -1118,6 +1118,7 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    crate::lazy::committed(at, len);
     if len == 0 || !known_holes() {
         return;
     }
@@ -2038,6 +2039,9 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    crate::lazy::lift(at, len);
+    #[cfg(feature = "diagnostics")]
+    crate::readwatch::lift(at, len, false);
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -2055,8 +2059,8 @@ pub fn writing(at: usize, len: usize) {
 }
 
 /// The kernel writes title memory `[at, at + len)` until what this returns
-/// is dropped ([`kernel_writing`]).
-pub struct KernelWrite(usize, usize);
+/// is dropped ([`kernel_writing`]): the blocks, and the range itself.
+pub struct KernelWrite(usize, usize, (usize, usize));
 
 /// The runtime is about to have the kernel write title memory
 /// `[at, at + len)` (a file read): its guarded blocks are opened, as by
@@ -2065,6 +2069,10 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    crate::lazy::lift_for("kernel", at, len);
+    crate::lazy::active_begin(at, len);
+    #[cfg(feature = "diagnostics")]
+    crate::readwatch::lift(at, len, false);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
@@ -2082,11 +2090,12 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
         }
     }
     crate::descriptor::host::remapped(at, len);
-    KernelWrite(first, if len == 0 { first } else { last })
+    KernelWrite(first, if len == 0 { first } else { last }, (at, len))
 }
 
 impl Drop for KernelWrite {
     fn drop(&mut self) {
+        crate::lazy::active_end(self.2.0, self.2.1);
         if self.0 == self.1 {
             return;
         }
@@ -2474,6 +2483,9 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    crate::lazy::freed(at, len);
+    #[cfg(feature = "diagnostics")]
+    crate::readwatch::freeing(at, len);
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -2571,6 +2583,29 @@ pub(crate) fn install() {
         // A fault of our own copies (`crate::safecopy`): whatever it is, if
         // it is not a block we guard, the copy fails and goes on from there.
         let ours = crate::safecopy::failing_exit(r.ExceptionAddress as usize);
+        // A page of title memory behind a copy (`crate::lazy`): what the
+        // card wrote is put in, the page given back, and the access runs
+        // again (and our copies' does not fail).
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && crate::lazy::fault(r.ExceptionInformation[1], r.ExceptionAddress as usize, ours.is_some())
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // A page the read watch guarded: its guard is gone, the access runs
+        // again (and our copies' does not fail).
+        #[cfg(feature = "diagnostics")]
+        if r.NumberParameters >= 2
+            && crate::readwatch::fault(
+                r.ExceptionCode,
+                r.ExceptionInformation[0],
+                r.ExceptionInformation[1],
+                r.ExceptionAddress as usize,
+                ours.is_some(),
+            )
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // SAFETY: as above.
         let context = unsafe { (*info).ContextRecord };
         let fail = move |exit: usize| {
@@ -2652,7 +2687,7 @@ pub(crate) fn install() {
 }
 
 /// Whether `at` is committed read-write memory now.
-fn writable(at: usize) -> bool {
+pub(crate) fn writable(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
     };

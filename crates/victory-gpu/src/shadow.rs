@@ -96,6 +96,9 @@ pub(crate) struct Shadow {
     changes_only: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
+    /// Lazy read-back (`crate::lazy`): which pieces title memory is behind
+    /// the copy in, and whether this copy still defers.
+    pub(crate) lazy: crate::lazy::State,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -2480,6 +2483,12 @@ impl Drop for Shadow {
             crate::inplace::gone(self.window, self.len);
             return;
         }
+        // Title memory still behind the copy goes in now, and its pages are
+        // given back: the memory outlives the copy (`crate::lazy`).
+        if self.lazy.any.load(Ordering::Acquire) {
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            self.land_stale(start / crate::lazy::PAGE * crate::lazy::PAGE, end.next_multiple_of(crate::lazy::PAGE));
+        }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
@@ -2875,6 +2884,14 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// For the read watch (`crate::readwatch`): where the title buffer starts
+    /// and its bytes, if its memory is the kernel's to watch (the title's
+    /// own allocation, not views of its physical pages).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn census_key(&self) -> Option<(u64, u64)> {
+        (self.watched.load(Ordering::Relaxed) == 1).then_some((self.start, self.len))
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -2987,6 +3004,7 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             mapped: false,
+            lazy: Default::default(),
             place: None,
         }
     }
@@ -3057,20 +3075,16 @@ impl Shadow {
         let mut parts = vec![self.inside(address, len)];
         for &(a, e) in pending.iter() {
             let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
+            parts = cut_out(parts, a, e);
+        }
+        // Nor the pieces title memory is behind the copy in (`crate::lazy`):
+        // their snapshot stays what it was before the first write not yet
+        // put back, so that the landing at the touch finds all of them.
+        if self.lazy.any.load(Ordering::Acquire) && !crate::lazy::protect_only() {
+            let stale = self.lazy.lock();
+            for &(a, e) in &stale.ranges {
+                parts = cut_out(parts, a, e);
             }
-            parts = rest;
         }
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
@@ -3362,7 +3376,12 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
-        if !pending.is_empty() || self.card.is_some() {
+        // (A copy with stale pieces keeps its snapshot: the landing at the
+        // touch compares against it, `crate::lazy`.)
+        if !pending.is_empty()
+            || self.card.is_some()
+            || (self.lazy.any.load(Ordering::Acquire) && !crate::lazy::protect_only())
+        {
             return;
         }
         if keeps() {
@@ -3385,6 +3404,7 @@ impl Shadow {
             kept.0.clear();
         }
         if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            self.lazy.snapshot.store(std::ptr::null_mut(), Ordering::Release);
             give_back(bytes);
         }
     }
@@ -3489,6 +3509,11 @@ impl Shadow {
         if from >= to {
             return false;
         }
+        // (Title memory behind this copy, `crate::lazy`, is left as it is:
+        // only the pages the title wrote are read below, and a stale one
+        // among them is landed by the handler, which needs none of the locks
+        // held here. Landing the whole range first, as at first, landed
+        // every deferred piece within its frame: run 14.)
         let busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -3729,6 +3754,9 @@ impl Shadow {
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
             return false;
         }
+        // What another copy left stale here is landed first: the asking
+        // below then sees it written (`crate::lazy`).
+        crate::lazy::lift_except(self, from, to - from);
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
         #[cfg(feature = "diagnostics")]
@@ -3750,6 +3778,8 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        // (As in `nothing_new`: other copies' stale pieces first.)
+        crate::lazy::lift_except(self, from, to - from);
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 // (A range whose blocks rest after a write has no guard now.)
@@ -4081,6 +4111,7 @@ impl Shadow {
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        self.lazy_sync(from - start, to - start);
         to - from
     }
 
@@ -4555,6 +4586,375 @@ impl Shadow {
             *at = (*at).max(now);
         }
         held
+    }
+}
+
+/// `parts` (offsets, from and to) without `[a, e)`.
+fn cut_out(parts: Vec<(usize, usize)>, a: usize, e: usize) -> Vec<(usize, usize)> {
+    let mut rest = Vec::with_capacity(parts.len() + 1);
+    for (from, to) in parts {
+        if e <= from || a >= to {
+            rest.push((from, to));
+            continue;
+        }
+        if from < a {
+            rest.push((from, a));
+        }
+        if e < to {
+            rest.push((e, to));
+        }
+    }
+    rest
+}
+
+/// Lazy read-back (`crate::lazy`): the landing of this copy's declared
+/// ranges put off until something touches the title memory behind them.
+impl Shadow {
+    /// Whether this landing of the copy is deferred: a copy in the PC's
+    /// memory of a title buffer in the title's own (kernel write-watched)
+    /// memory, not a window, not in place, and not touched too often.
+    pub(crate) fn lazy_back(&self) -> bool {
+        crate::lazy::on()
+            && self.card.is_none()
+            && !self.window
+            && self.place.is_none()
+            && self.len >= crate::lazy::min_bytes()
+            && self.watched.load(Ordering::Relaxed) == 1
+            && crate::lazy::private(&self.lazy, self.start as usize)
+            && self.alone()
+            && self.lazy.settle()
+    }
+
+    /// Whether no other copy holds any of this copy's title memory (a title
+    /// buffer inside it or around it with a copy of its own, or a copy of
+    /// memory outside buffers). Another copy learns of the card's writes
+    /// only from the landing's writes into title memory (the kernel's bits
+    /// it asks about), and the host skips its refresh when they say
+    /// nothing: a deferred landing would leave it, and the shaders reading
+    /// through it, with the bytes from before (run 12: the world's first
+    /// frames, then the title dead on what the card made of them). Asked
+    /// again when the buffers changed.
+    fn alone(&self) -> bool {
+        let changes = BUFFERS_CHANGED.load(Ordering::SeqCst);
+        let known = self.lazy.alone.load(Ordering::Relaxed);
+        if known >> 1 == changes {
+            return known & 1 != 0;
+        }
+        let (start, end) = (self.start, self.start + self.len);
+        let this = std::ptr::from_ref(self);
+        let buffers = buffers_read();
+        let other = buffers
+            .range(..(end, usize::MAX))
+            .any(|(&(s, _), e)| e.end > start && s < end && e.shadow.as_ref().is_none_or(|c| !std::ptr::eq(Arc::as_ptr(c), this)));
+        drop(buffers);
+        let loose = !other
+            && LOOSE
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .range(..(end, u64::MAX))
+                .any(|(&(s, len), c)| s + len > start && s < end && !std::ptr::eq(Arc::as_ptr(c), this));
+        let alone = !other && !loose;
+        if !alone {
+            crate::lazy::STATS[crate::lazy::NOT_ALONE].fetch_add(1, Ordering::Relaxed);
+        }
+        self.lazy.alone.store(changes << 1 | u64::from(alone), Ordering::Relaxed);
+        alone
+    }
+
+    /// The whole pages of 4 KiB of title memory that piece `piece` lies in.
+    fn lazy_pages(&self, piece: usize) -> (usize, usize) {
+        use crate::lazy::PAGE;
+        let (lo, hi) = self.piece(piece);
+        let start = self.start as usize;
+        ((start + lo) / PAGE * PAGE, (start + hi).next_multiple_of(PAGE))
+    }
+
+    /// Whether 64 KiB block `block` of title memory holds a stale piece.
+    pub(crate) fn has_stale_block(&self, block: usize) -> bool {
+        if !self.lazy.any.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(piece) = block.checked_sub(self.start as usize / PIECE) else {
+            return false;
+        };
+        self.lazy.lock().has(piece)
+    }
+
+    /// The pieces (indices) whose pages may hold title memory `[from, to)`.
+    fn pieces_under(&self, from: usize, to: usize) -> std::ops::Range<usize> {
+        if from >= to {
+            return 0..0;
+        }
+        let first = self.start as usize / PIECE;
+        let count = self.pieces(0, (self.len as usize).max(1)).end;
+        let lo = (from / PIECE).saturating_sub(first).min(count);
+        let hi = ((to - 1) / PIECE + 1).saturating_sub(first).min(count);
+        lo..hi.max(lo)
+    }
+
+    /// A landing of this copy's declared ranges `declared` (title
+    /// addresses) is put off: their pieces are noted stale and their pages
+    /// made no-access, but for those a kernel write is under way in, which
+    /// are landed now. `false` if it cannot be (no snapshot to compare
+    /// against later): the caller lands as before.
+    pub(crate) fn defer_back(self: &Arc<Self>, declared: &[(usize, usize)]) -> bool {
+        use crate::lazy;
+        if !lazy::protect_only() {
+            // The snapshot, for the landings at a touch (it stays while any
+            // piece is stale: `copy_back_done`).
+            let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(snapshot) = before.as_mut().map(Vec::as_mut_ptr) else {
+                lazy::STATS[lazy::NO_SNAPSHOT].fetch_add(1, Ordering::Relaxed);
+                return false;
+            };
+            self.lazy.snapshot.store(snapshot, Ordering::Release);
+        }
+        let active = lazy::active();
+        let (mut fresh, mut now): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+        // The declared offsets, joined: what is compared and put, now or at
+        // a touch (never the rest of a piece).
+        let mut offsets = lazy::Stale::default();
+        {
+            let mut stale = self.lazy.lock();
+            if stale.bits.is_empty() {
+                stale.bits = vec![0; self.pieces(0, (self.len as usize).max(1)).end.div_ceil(64)];
+            }
+            for &(a, e) in declared {
+                let (from, to) = self.inside(a, e.saturating_sub(a));
+                if from >= to {
+                    continue;
+                }
+                offsets.add(from, to);
+                for piece in self.pieces(from, to) {
+                    if stale.has(piece) {
+                        continue;
+                    }
+                    let (lo, hi) = self.lazy_pages(piece);
+                    if active.iter().any(|&(x, y)| x < hi && y > lo) { now.push(piece) } else { fresh.push(piece) }
+                }
+            }
+            fresh.sort_unstable();
+            fresh.dedup();
+            now.sort_unstable();
+            now.dedup();
+            // A piece under a kernel write is landed now, not later: its
+            // offsets are not among the stale ones.
+            for &piece in &now {
+                let (lo, hi) = self.piece(piece);
+                offsets.remove(lo, hi);
+            }
+            // Pieces stale from before keep their offsets; the fresh ones
+            // add theirs (a piece already stale that this flight declared
+            // again adds any new offsets too).
+            let mut kept = lazy::Stale::default();
+            for &(a, b) in &offsets.ranges {
+                kept.add(a, b);
+            }
+            for &(a, b) in &stale.ranges {
+                kept.add(a, b);
+            }
+            stale.ranges = kept.ranges;
+            // Pieces side by side: one change of protection. Each is noted
+            // stale, and the copy known to the handler, BEFORE its pages
+            // are protected: a touch between the two then finds the piece
+            // in the handler and waits for this lock. (The other way round
+            // a title thread crashed on the page, and a copy of ours failed
+            // over to its sparse reader, which takes a no-access page for a
+            // hole and leaves zeros: run 7, a device hang while loading.)
+            lazy::register(self);
+            let first = self.start as usize / PIECE;
+            let mut i = 0;
+            while i < fresh.len() {
+                let mut j = i;
+                while j + 1 < fresh.len() && fresh[j + 1] == fresh[j] + 1 {
+                    j += 1;
+                }
+                let run = &fresh[i..=j];
+                let mut bytes = 0;
+                for &piece in run {
+                    stale.set(piece);
+                    lazy::block_stale(first + piece);
+                    let (a, b) = self.piece(piece);
+                    bytes += stale.parts(a, b).iter().map(|p| (p.1 - p.0) as u64).sum::<u64>();
+                }
+                self.lazy.any.store(true, Ordering::Release);
+                let (lo, hi) = (self.lazy_pages(run[0]).0, self.lazy_pages(run[run.len() - 1]).1);
+                if lazy::protect(lo, hi) {
+                    lazy::trace(format_args!(
+                        "deferred copy {:#x}+{:#x} pieces {}..={} pages {lo:#x}-{hi:#x}",
+                        self.start,
+                        self.len,
+                        run[0],
+                        run[run.len() - 1]
+                    ));
+                    lazy::STATS[lazy::DEFERRED_PIECES].fetch_add(run.len() as u64, Ordering::Relaxed);
+                    lazy::STATS[lazy::DEFERRED_BYTES].fetch_add(bytes, Ordering::Relaxed);
+                } else {
+                    for &piece in run {
+                        stale.clear(piece);
+                        let (a, b) = self.piece(piece);
+                        stale.remove(a, b);
+                    }
+                    now.extend_from_slice(run);
+                }
+                i = j + 1;
+            }
+            if stale.none() {
+                self.lazy.any.store(false, Ordering::Release);
+            }
+            // Verifying: title memory gets the bytes now; the pieces stay
+            // noted and protected, so a touch goes through the handler as
+            // it would, and finds nothing left to put.
+            if lazy::verify() && !fresh.is_empty() {
+                let parts: Vec<(usize, Vec<(usize, usize)>)> = fresh
+                    .iter()
+                    .map(|&p| {
+                        let (lo, hi) = self.piece(p);
+                        (p, stale.parts(lo, hi))
+                    })
+                    .collect();
+                drop(stale);
+                self.land_parts(&parts);
+            }
+        }
+        if !now.is_empty() {
+            now.sort_unstable();
+            now.dedup();
+            lazy::STATS[lazy::UNDER_WRITE].fetch_add(now.len() as u64, Ordering::Relaxed);
+            let parts: Vec<(usize, Vec<(usize, usize)>)> = now
+                .iter()
+                .map(|&p| {
+                    let (lo, hi) = self.piece(p);
+                    (p, offsets.parts(lo, hi))
+                })
+                .collect();
+            self.land_parts(&parts);
+        }
+        true
+    }
+
+    /// A refresh put title memory's bytes at offsets `[from, to)` into the
+    /// copy: into the snapshot too, while this copy defers landings. The
+    /// eager landing takes the snapshot again after every refresh
+    /// (`writing` comes after it); here a stale piece's is kept, so without
+    /// this the title's bytes the refresh brought would differ from it, be
+    /// taken for the card's at the next landing, and go over whatever the
+    /// title wrote there since (run 8: a pointer put back to an old value).
+    fn lazy_sync(&self, from: usize, to: usize) {
+        let snapshot = self.lazy.snapshot.load(Ordering::Acquire);
+        if snapshot.is_null() || self.card.is_some() || from >= to || to > self.len as usize {
+            return;
+        }
+        // SAFETY: inside the copy's mapping and the snapshot's allocation
+        // (both `len` bytes; the snapshot stays while the pointer is set).
+        // The refresh writes these offsets of the copy, and nothing lands
+        // them meanwhile: a piece landed at a touch is landed before the
+        // refresh reads its pages.
+        unsafe { std::ptr::copy_nonoverlapping(self.data.add(from), snapshot.add(from), to - from) };
+        crate::lazy::STATS[crate::lazy::SYNCED].fetch_add((to - from) as u64, Ordering::Relaxed);
+    }
+
+    /// The given parts (offsets from the piece's first) of pieces landed
+    /// now, as the eager landing would: what differs between the copy and
+    /// the snapshot there goes into title memory and into the snapshot.
+    /// Only declared offsets may be given: the snapshot holds nothing else.
+    /// Returns the bytes put.
+    fn land_parts(&self, pieces: &[(usize, Vec<(usize, usize)>)]) -> u64 {
+        use crate::lazy::{self, STATS};
+        // Protecting only: the eager landing puts the bytes; here nothing.
+        if lazy::protect_only() {
+            STATS[lazy::LANDED_PIECES].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+            return 0;
+        }
+        let started = std::time::Instant::now();
+        let _landing = lazy::landing();
+        // No lock on the snapshot: the faulting thread may hold it
+        // (`merge_under_writes`), and the snapshot stays where it is while
+        // any piece is stale.
+        let held = self.lazy.snapshot.load(Ordering::Acquire);
+        if held.is_null() {
+            STATS[lazy::NO_SNAPSHOT].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+            return 0;
+        }
+        let mut notes = crate::land::Notes::default();
+        let mut put = 0;
+        for (piece, parts) in pieces {
+            let (lo, hi) = self.piece(*piece);
+            if lo >= hi || hi > self.len as usize || parts.is_empty() || parts.iter().any(|p| p.1 > hi - lo) {
+                continue;
+            }
+            // SAFETY: inside the copy's mapping and the snapshot's allocation
+            // (both hold `len` bytes; the snapshot stays while any piece is
+            // stale, `copy_back_done`), at declared offsets. The copy is
+            // read once; the snapshot is written here and, under flights'
+            // writes, with the title's own bytes, the same on both sides.
+            put += unsafe { crate::land::piece(self.start as usize + lo, self.data.add(lo), held.add(lo), parts, false, &mut notes, self) };
+        }
+        notes.flush();
+        STATS[lazy::LANDED_PIECES].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+        STATS[lazy::LANDED_BYTES].fetch_add(put, Ordering::Relaxed);
+        STATS[lazy::LAND_US].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        put
+    }
+
+    /// The stale pieces whose pages hold title memory `[from, to)` are
+    /// landed: their pages given back first (the merge reads and writes
+    /// them), then what differs put in, under the lock a second toucher
+    /// waits for. Returns the bytes put.
+    pub(crate) fn land_stale(&self, from: usize, to: usize) -> u64 {
+        if !self.lazy.any.load(Ordering::Acquire) {
+            return 0;
+        }
+        let range = self.pieces_under(from, to);
+        if range.is_empty() {
+            return 0;
+        }
+        // (Inside a landing of this thread's the lock may be its own: then
+        // the piece being written is the one being landed.)
+        let Some(mut stale) = self.lazy.lock_unless_landing() else {
+            return 0;
+        };
+        let found: Vec<usize> = range.filter(|&p| stale.has(p)).collect();
+        if found.is_empty() {
+            return 0;
+        }
+        let mut given: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < found.len() {
+            let mut j = i;
+            while j + 1 < found.len() && found[j + 1] == found[j] + 1 {
+                j += 1;
+            }
+            let (lo, hi) = (self.lazy_pages(found[i]).0, self.lazy_pages(found[j]).1);
+            crate::lazy::unprotect(lo, hi);
+            given.push((lo, hi));
+            i = j + 1;
+        }
+        let mut parts: Vec<(usize, Vec<(usize, usize)>)> = Vec::with_capacity(found.len());
+        for &p in &found {
+            stale.clear(p);
+            let (lo, hi) = self.piece(p);
+            parts.push((p, stale.parts(lo, hi)));
+            stale.remove(lo, hi);
+        }
+        if stale.none() {
+            self.lazy.any.store(false, Ordering::Release);
+        }
+        let put = self.land_parts(&parts);
+        drop(stale);
+        crate::lazy::trace(format_args!(
+            "landed copy {:#x}+{:#x} pieces {:?} for {from:#x}-{to:#x}: {put} bytes",
+            self.start, self.len, found
+        ));
+        let first = self.start as usize / PIECE;
+        let blocks: Vec<usize> = found.iter().map(|&p| first + p).collect();
+        crate::lazy::blocks_landed(&blocks);
+        // A page at either end may be another copy's too (buffers back to
+        // back, not on page lines): read-write now for it as well.
+        for (lo, hi) in given {
+            crate::lazy::land_others(self, lo, hi);
+        }
+        put
     }
 }
 
