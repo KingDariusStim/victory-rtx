@@ -624,13 +624,34 @@ pub(crate) extern "system" fn create_compute(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    let shaders: Vec<Arc<Shader>> = copy("compute", &desc.stage).into_iter().collect();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(hash) = refused_shader(&shaders) {
+        // Diagnostics: the title is told the pipeline could not be made, to
+        // see what it does without it (an upscaler it falls back from, say).
+        tracing::warn!(hash, "compute pipeline refused to the title (VICTORY_REFUSE_PIPELINES)");
+        return windows_sys::Win32::Foundation::E_FAIL;
+    }
     hand_out(
-        copy("compute", &desc.stage).into_iter().collect(),
+        shaders,
         #[cfg(windows)]
         None,
         iid,
         out,
     )
+}
+
+/// `VICTORY_REFUSE_PIPELINES=<hash>,<hash>..` (diagnostics): compute
+/// pipelines of these shaders are refused to the title at creation, as if
+/// the device could not make them.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn refused_shader(shaders: &[Arc<Shader>]) -> Option<&str> {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| parse_skip_hashes(&std::env::var("VICTORY_REFUSE_PIPELINES").unwrap_or_default()));
+    if hashes.is_empty() {
+        return None;
+    }
+    shaders.iter().find(|s| hashes.contains(&s.hash)).map(|s| s.hash.as_str())
 }
 
 /// Device method 0x1f0: the plain compute description plus console

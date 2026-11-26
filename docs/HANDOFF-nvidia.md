@@ -560,6 +560,90 @@ How to get there quickly: the first cutscene with dialogue (the prison yard into
 flashback). Use `Drive-Run.ps1 -EnterAfter` to skip the menus, and capture a few hundred frames
 in which a line is spoken. Done when: the mouths move in time with the lines in that cutscene.
 
+## The frame rate (2026-11-26 evening; the user's bar: 15 fps in gameplay and correct shading)
+
+The user watched run 151644: the intro still stutters to the eye although the presents are clean
+(one 76 ms frame in the 15 s after the press), and the world ran at 4-5 fps. They then asked for
+the frame rate first: "characterize what's eating at the framerate, find the slowest functions and
+try to accelerate them", later "keep working until you get at least 15 fps during gameplay and
+correct shading". Their hypothesis for the intro, to check last: stale draws showing up a couple
+of milliseconds late (frames repeated or out of order, presents on time).
+
+**Where the time went (the diner cutscene, the heaviest scene so far):**
+
+- Timeline (`VICTORY_TIMELINE`, `VICTORY_CARD_SPANS=1`): the card ran 146-178 ms a frame over
+  11-13 submissions and idled 50 ms between them; our CPU threads were nearly idle. GPU-bound.
+  `nvidia-smi`: 100% utilisation at only 100 W of 250, 4% memory utilisation, PCIe 3.0 x16 at
+  0.1-1.3 GB/s: the SMs were stalling, not computing.
+- Per-command card times (`VICTORY_GPU_TIMING=1 VICTORY_D3D12_DRED=1 VICTORY_LATE_WAIT=0`: every
+  list waited for and every noted command stamped; `copystat`'s "the card's time by command"
+  every 5 s): 151 ms a frame of commands, 95 ms in 3,200 dispatches, 48 ms in 4,900 indirect
+  dispatches, 5 ms in all the draws. The top: `bvh_skinning:CSComputeSkinningRigidVelocity`
+  (8f9eb68d0c6dd5cf) 50-70 ms a frame in dispatches of 900-2,768 groups taking 4-13 ms each,
+  `indirect_light_probes:CS_Primary_GatherCopy` 12-18 ms in one dispatch, an INT8 dot-product
+  network not in shaders.rpf (8e614708143ef917, 1,664 `dot4AddPacked`: the title's FSR4 upscaler,
+  "FFX FSR4 ... falling back to NewBE") 12 ms, `indirect_diffuse_lighting:CS_ScreenProbes_TraceRays`
+  6-12 ms. `dxc -dumpbin` of the skinning kernel (scratchpad `cdxil/*.dxil`): a per-thread linear
+  search over a table of 176-byte records, two dependent loads an iteration, up to 4,096
+  iterations; the table is a 998 KB title buffer.
+- **The cause: title buffer copies in the PC's memory.** `shadow.rs` `default_card_limits_mb` gave
+  cards of 12 GiB and under (16 MiB minimum, 512 MiB) for copies in the card's memory, and
+  `settings.local.ps1` had `VICTORY_CARD_ROOM_FOR_BUFFERS=0`, so nearly every title buffer lived in
+  `shared_buffer` memory (CUSTOM heap, pool L0: system memory over PCIe) and every dependent load
+  of those kernels crossed the bus. Windows of title memory (`VICTORY_CARD_WINDOWS_MB=2048`) alone
+  gave a tenth; buffers of 16 MiB and up (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`) 5%; **every buffer of
+  64 KiB and up (`VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_CARD_BUFFERS_MB=1536`) took the card's
+  command time from 150-230 to 59-90 ms a frame**, the rigid skinning from 50 ms to 0.8, and the
+  cutscene from 4-5 to 8-11 fps (runs 155020-155513). Now the default for such budgets (commit
+  after 86c8bbc); `settings.local.ps1` adds `VICTORY_CARD_WINDOWS_MB=1024` and
+  `VICTORY_TEXTURE_BUDGET_MB=1536` so the copies find room (the card then sits at 6.4-6.7 of 7.1
+  GB). The texture cap costs textures ("walls losing textures" may be partly this); not tuned yet.
+- Ruled out: the 700 full UAV barriers a frame (`VICTORY_BARRIER_TEST=both`: no change), telling
+  the title its GPU frame takes 40 ms (`VICTORY_GPU_LOAD_MS=40`: no dynamic resolution response),
+  reporting a 1080p display (`VICTORY_DISPLAY_MODE=1920x1080`: the title keeps a 3840x2160
+  viewport and 4K targets anyway).
+- After the fix, steady state in the cutscene: 79 ms a frame of commands over 8,000 commands.
+  By family (top 40 kinds of each report, 56 of the 79 ms): the FSR4 network 12 ms,
+  `ped_skinning_cs` 9.6 ms in 215 dispatches of 25-40 us, strand hair (`smh_*`) about 13 ms,
+  `compute_graph_ops` (the facial rig) 5 ms, `scattering_transmittance_system` 3 ms, our alias
+  copies 2.3 ms in 78. Plus 25-30 ms a frame of card idle between submissions (many small
+  causes in the chain; the submit thread spends the frame waiting for the card). The window
+  shot at the end of the cutscene, Lucia's hair filling the screen, holds 8.8 fps.
+- CPU profile (`VICTORY_PROFILE=100,140,2,<file>`, fixed this session: the sampler died in
+  `crash::unwind_into` on program counters outside every image; symbolise with
+  scratchpad `symb/` (the `pdb` crate) against `target/diag/victory.pdb`): over 40 s the title's
+  two busiest threads used 24 and 18 s, `victory-submit` 15 s (of it `shadow::wide_each
+  refresh_fronts`/`Batch::update`, the copies' refresh, about a third), eight list threads 6-8 s
+  each (`draw::State::bind`/`tables`), the relay 5.6 s.
+
+**Ideas not yet tried, in the order I would try them:** (1) refuse the FSR4 network pipeline to
+the title (`VICTORY_REFUSE_PIPELINES=8e614708143ef917`, added, diagnostics) to see whether it
+falls back to a cheaper upscaler, 12 ms; (2) the translator: group doubling for kernels without
+LDS or group sync (two console groups of 32 in one host group of 64: Turing holds 16 groups per
+SM, so 32-thread groups cap occupancy at half); (3) the 25-30 ms of card idle: the chain to each
+submission (`fr5`/`fr7` timelines in the scratchpad); (4) `VICTORY_TEXTURE_BUDGET_MB` against the
+room the copies need, for the textures' sake.
+
+**Shading leads from the logs (the user: Lucia's hair reads blonde/red in the window shot, the
+ray tracing through her hair looks wrong, walls lose textures):**
+
+- `sr_tracing:CS_Tiling_Generate_Opaque` (2cc4c197ee29e291), a tiling pass of the software ray
+  tracer, was refused on this card and dropped every frame. Upstream's translator runs it as
+  local 32-lane waves; 20 of upstream's shader-crate commits are now transplanted (cherry-picked
+  from xtx/main 2de9980 onto rtx-next; the translate-tool one, 9b7dc77, skipped) and the pipeline
+  is created. The other six refused programs emit and validate but the driver still says "The
+  parameter is incorrect" (they keep 64 lanes).
+- "placed unordered texture view not mirrored (null: writes through it are lost)": 4,096+ times a
+  run, formats 71/72/98 (BC1/BC7). Compute shaders write block-compressed title textures through
+  unordered views, as the console allows and D3D12 does not; the writes are dropped
+  (`descriptor/host.rs` `make`, `View::Placed(true, ..)` of a texture). Likely the runtime texture
+  compression whose output the walls wait for. Fix: a UINT alias of the BC texture (placed on the
+  same heap, or castable formats) for the view, and the host copy as the source of truth after a
+  shader wrote it.
+- The three computes that do not translate ("a lane mask exchanged where not every lane runs":
+  477b52e73ddeb6f2, 17af85f170e66f30, 8b437ab61d8008fe) write BC textures too, 1.3 dispatches a
+  frame each, dropped.
+
 ## How to run
 
 ```powershell
@@ -568,11 +652,12 @@ cargo build --locked --profile diag -p victory --features diagnostics --bins
 cd tools\runkit
 .\Run-Victory.ps1 -Fast -Book          # first run: builds pipelines as it goes, writes them down
 .\Run-Victory.ps1 -Mode warm           # after any build or driver change: builds the used ones ahead
-.\Run-Victory.ps1 -Fast -Book          # then play
+.\Run-Victory.ps1 -Fast -Book -Console series-s   # then play (the S profile fits the 8 GB card)
 ```
 
-For an 8 GB card add, until step 5 is done (settings.local.ps1 `$Defaults`):
-`VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1024'; VICTORY_CARD_ROOM_FOR_BUFFERS = '0'`.
+For an 8 GB card (settings.local.ps1 `$Defaults`, this PC): `VICTORY_CARD_ROOM_FOR_TARGETS_MB =
+'1024'; VICTORY_CARD_WINDOWS_MB = '1024'; VICTORY_TEXTURE_BUDGET_MB = '1536'` (the buffer copies'
+64 KiB / 1,536 MiB limits are the build's defaults for such cards since 2026-11-26).
 
 ## Quirks that cost time
 
