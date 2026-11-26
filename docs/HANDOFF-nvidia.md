@@ -365,6 +365,21 @@ run 34 (after, 4,000 frames of it) it is sharp and clean throughout, Lucia's hai
 Run 34: refused 0.05%, 5.5 fps with 4,405 draws a frame (run 32: 6.8 fps, 3,788 draws, the rest
 dropped).
 
+**Upstream merged (runs 35-37, commits c4e177f and 0ef7677).** avatarmanz's 33 commits (frame
+meter thread, heap records read in place, up queue, textures shown in their slots only once the
+lists sent before them ran) merge with one conflict in the meter's lines. Their pooled textures
+at 64 KiB multiples took this card over its budget (7,623 of 7,219 MB) and the frame's card time
+from 118 to 430 ms (2.0 fps); `VICTORY_POOL_SMALL` unset is now on for cards under 12 GB, and the
+merged tree runs as before (run 37: 5.58 fps, 6,993 MB, 0.02% refused).
+
+**The black screens before the world (run 37-39, commit a440f72).** The title presents two planes
+on every frame (descriptions 72 bytes apart): the game's picture, and over it its 2D (menus,
+title screen, loading cards, HUD). Only the first was shown. `host/overlay.rs` blends the second
+over the first (premultiplied alpha, scaled to the first's size) into a texture of the window's
+and copies that to the swap chain (`VICTORY_OVERLAY_PLANE=0`: the first alone). Run 39: the
+title screen, the logos, the illustrated cards and the loading screens show; the world as before.
+Not read yet: the planes' source and placement rectangles, colour spaces and filters.
+
 **What the refusals look like on screen (run 26, `VICTORY_CAPTURE_WORLD`).** The presented frames
 every 8th frame show, walking from the cell to the yard: a rectangle of an older picture over the
 new one (frames 5075-5123 of that run), the "jumps to frames a second or two old" seen in play;
