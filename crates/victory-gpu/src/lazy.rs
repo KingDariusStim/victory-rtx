@@ -240,13 +240,27 @@ impl State {
         self.stale.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The lock, unless this thread is landing and it is not free (its own,
-    /// or another thread's that it must not wait for inside a handler).
+    /// The lock, unless this thread is landing and the lock is its own: then
+    /// `None`. Inside a landing the lock cannot be waited for outright (it
+    /// may be this thread's), but another thread holds it only for
+    /// microseconds (a deferral, a landing of one piece), so it is tried for
+    /// a while first: giving up at once left a neighbour's piece stale on a
+    /// page just given back (run 17).
     pub(crate) fn lock_unless_landing(&self) -> Option<MutexGuard<'_, Stale>> {
-        if is_landing() {
-            return self.stale.try_lock().ok();
+        if !is_landing() {
+            return Some(self.lock());
         }
-        Some(self.lock())
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok(guard) = self.stale.try_lock() {
+                return Some(guard);
+            }
+            if started.elapsed() > std::time::Duration::from_millis(2) {
+                STATS[GAVE_UP].fetch_add(1, Relaxed);
+                return None;
+            }
+            std::thread::yield_now();
+        }
     }
 
     /// The title touched a stale page: whether the copy should land eagerly
@@ -388,6 +402,19 @@ pub(crate) fn private(state: &State, at: usize) -> bool {
 pub(crate) fn min_bytes() -> u64 {
     static MIN: OnceLock<u64> = OnceLock::new();
     *MIN.get_or_init(|| std::env::var("VICTORY_LAZY_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 10)
+}
+
+/// Only copies no other copy overlaps defer (on; `VICTORY_LAZY_ALONE=0`:
+/// every copy). With the deferred pages noted in the journal the other
+/// copies of the memory refresh, fault and land them all the same: run 17,
+/// 637 pieces a frame deferred and 735 landed within the frame, 703 of them
+/// at faults of our own copies, 900 ms a frame in the handler. The title's
+/// buffers lie inside bigger ones, each with a copy; what one copy defers
+/// the others need the same frame. So deferring pays only where a copy is
+/// alone with its memory, about one per cent of the bytes landed here.
+pub(crate) fn alone_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_ALONE").is_none_or(|v| v != "0"))
 }
 
 /// Whether the trace is on (so that what it says is only made then).
@@ -593,7 +620,8 @@ pub(crate) const NEIGHBOURS: usize = 17;
 pub(crate) const SYNCED: usize = 18;
 pub(crate) const COMMITS: usize = 19;
 pub(crate) const NOT_ALONE: usize = 20;
-const COUNT: usize = 21;
+pub(crate) const GAVE_UP: usize = 21;
+const COUNT: usize = 22;
 pub(crate) static STATS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
 
 /// For the frame-rate line.
@@ -616,7 +644,7 @@ pub(crate) fn log(frames: f64) {
          kernel write {:.1}, landed at once under one {:.1}; protections {:.2} ms, {:.0} refused, {:.0} pages not read-write; \
          {} copies deferring so far, {} gone back to eager, {} landings with no snapshot, {:.0} pages given back unclaimed, \
          {:.1} bytes landed for a neighbour, {:.2} MB of refreshed bytes kept in snapshots, {:.0} commits over stale pieces, \
-         {:.0} landings kept eager for another copy of the memory{}",
+         {:.0} landings kept eager for another copy of the memory, {:.0} locks given up on inside a landing{}",
         per(DEFERRED_PIECES),
         per(DEFERRED_BYTES) / 1e6,
         per(LANDED_PIECES),
@@ -638,6 +666,7 @@ pub(crate) fn log(frames: f64) {
         per(SYNCED) / 1e6,
         s[COMMITS],
         per(NOT_ALONE),
+        s[GAVE_UP],
         match mode() {
             2 => " (VICTORY_LAZY_BACK=2: landed at once all the same)",
             3 => " (VICTORY_LAZY_BACK=3: protections only, the landing eager)",

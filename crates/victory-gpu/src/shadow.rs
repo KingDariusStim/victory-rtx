@@ -3715,6 +3715,14 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        // Nor this copy's own stale ranges (`crate::lazy`): the copy has
+        // what the card wrote there, title memory is behind it, and the
+        // journal says written (so that the other copies refresh); landed
+        // at a touch, after which the pages are refreshed as any.
+        if self.lazy.any.load(Ordering::Acquire) {
+            let stale = self.lazy.lock();
+            busy.extend(stale.ranges.iter().map(|&(a, b)| (start + a, start + b)).filter(|&(a, e)| a < to && e > from));
+        }
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -3752,6 +3760,12 @@ impl Shadow {
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+            return false;
+        }
+        // (And around its own stale ranges, `Shadow::update`.)
+        if self.lazy.any.load(Ordering::Acquire)
+            && self.lazy.lock().ranges.iter().any(|&(a, b)| start + a < to && start + b > from)
+        {
             return false;
         }
         // What another copy left stale here is landed first: the asking
@@ -4621,7 +4635,7 @@ impl Shadow {
             && self.len >= crate::lazy::min_bytes()
             && self.watched.load(Ordering::Relaxed) == 1
             && crate::lazy::private(&self.lazy, self.start as usize)
-            && self.alone()
+            && (!crate::lazy::alone_only() || self.alone())
             && self.lazy.settle()
     }
 
@@ -4801,6 +4815,36 @@ impl Shadow {
             }
             if stale.none() {
                 self.lazy.any.store(false, Ordering::Release);
+            }
+            // The deferred pages are noted as written in the watch's journal
+            // (as a landing through a view of ours is): every other copy or
+            // texture of this memory that asks sees them written, reads
+            // title memory, faults, and so lands them. The eager landing's
+            // own writes did that through the kernel's bits; without this
+            // the host skipped those refreshes and shaders read the bytes
+            // from before through the other copies. This copy's own refresh
+            // leaves its stale ranges out (`Shadow::update`).
+            if !fresh.is_empty() && !lazy::protect_only() {
+                let (mut pages, mut spans): (Vec<usize>, Vec<(usize, usize)>) = (Vec::new(), Vec::new());
+                let start = self.start as usize;
+                for &piece in &fresh {
+                    if !stale.has(piece) {
+                        continue;
+                    }
+                    let (lo, hi) = self.piece(piece);
+                    for (a, b) in stale.parts(lo, hi) {
+                        let (from, to) = (start + lo + a, start + lo + b);
+                        spans.push((from, to - from));
+                        for page in from / lazy::PAGE..to.div_ceil(lazy::PAGE) {
+                            if pages.last() != Some(&page) {
+                                pages.push(page);
+                            }
+                        }
+                    }
+                }
+                if !pages.is_empty() {
+                    crate::watch::landed_beside(&pages, &spans);
+                }
             }
             // Verifying: title memory gets the bytes now; the pieces stay
             // noted and protected, so a touch goes through the handler as

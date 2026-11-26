@@ -173,18 +173,24 @@ of 35-40 MB landed, copying back still 32-37 ms. Two reasons, both structural:
 2. The 94 MB card copy (75 % of the bytes) is not covered: its pieces need a fetch from the card at
    the touch (a fetch kit usable from any thread; the bookkeeping fits, see `relay_card_back`).
 
-**What it needs next, in order.**
-1. Let overlapped copies defer: when a copy defers pieces, mark their pages as written in the
-   watch's journal (`crate::watch::landed_beside` is the primitive for a write the kernel did not
-   see), so the overlapping copies' refreshes see dirt, read title memory, fault, and land the
-   deferring copy's piece. Overlapped ranges then land once a frame through the fault path (no gain
-   there), ranges nobody else holds stay deferred. Measure with the "lazy read-back per frame" line.
-2. Phase 2, the card copy: in `relay_card_back`, pieces of a deferring card copy are noted stale
-   instead of fetched; the touch fetches them (one `CopyBufferRegion` into a small staging buffer on
-   a list/fence of the handler's own, numbered after every send so far so `Card::sent` needs no older
-   notes) and merges with `land_card`.
-3. Only then judge the lever: the census says 98 % of landed bytes could go, the machinery says the
-   overlap structure decides how much of that is reachable.
+**Run 17 settled it.** Overlapped copies were let defer too, their pages noted as written in the
+watch's journal (`crate::watch::landed_beside`) so the other copies would refresh through the fault
+path: 637 pieces a frame deferred, 735 landed within the frame, 703 of them at faults of our own
+copies, 900 ms a frame in the handler. The title's buffers lie inside bigger ones and each has a copy;
+what one copy defers, the copies inside it need the same frame. The census's "touched first by our
+copies: 198,179" was that, not the echo it was read as. So the lazy read-back stays as it is: correct,
+off by default, on with `VICTORY_LAZY_BACK=1` (`VICTORY_LAZY_ALONE=0` is run 17's rule), worth about
+one per cent of the landed bytes here.
+
+**What would make it pay** is not in the landing but in the copies: one copy per region of title
+memory, with the smaller buffers inside it as views at offsets of the same host buffer (what
+avatarmanz lists first under "What is next": "view the card's own buffers where fills copy them
+now"). Then the card's writes are in the one copy every view reads, no title memory stands between
+the copies, and the landing is left to serve the title's CPU alone, which the census says reads
+0.2 % of it. That is a refactor of `shadow.rs`'s buffer registry (`BUFFERS`, `lookup`, `card_for`)
+and of every place that assumes a copy begins at its buffer's start; the lazy read-back as built is
+then the right landing for it. Phase 2 (the 94 MB card copy, fetched at the touch) belongs after
+that refactor for the same reason: it is the most overlapped memory of all.
 
 Run 6 also showed ~700 draws a frame dropped "without a host pipeline" against run 5's 5: new scene
 content, not a regression; `-Mode warm` after a run covers it. Runs 7-16 were driven unattended (a
