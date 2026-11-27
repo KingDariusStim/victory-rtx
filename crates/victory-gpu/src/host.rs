@@ -4964,8 +4964,23 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+    fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        // The card has run these flights: their tables' dynamic slots go
+        // back at once (`VICTORY_EARLY_TABLES=0`: when the lists are
+        // recycled after the landing, as before). The landing's merges took
+        // 18 ms a frame and the recycling waits for another thread, and in
+        // play the slots ran out with 230,000 of 262,144 held (run 102012:
+        // 285-550 tables refused a report, their draws dropped).
+        if early_tables() {
+            for item in &mut items {
+                if let Late::Run(flight) = item {
+                    for list in &mut flight.lists {
+                        list.release_tables();
+                    }
+                }
+            }
+        }
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -10673,3 +10688,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+/// Whether flights give their tables' dynamic slots back as soon as the
+/// card has run them (`Host::relay_land`); `VICTORY_EARLY_TABLES=0`: when
+/// their lists are recycled, as before.
+fn early_tables() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_TABLES").is_none_or(|v| v != "0"))
+}

@@ -203,6 +203,13 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// The card has run this list: its descriptor tables' dynamic slots
+    /// are given back now ([`crate::draw::State::tables_done`]), not when
+    /// the list is recycled after its flight has landed.
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
