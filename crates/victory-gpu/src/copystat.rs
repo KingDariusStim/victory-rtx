@@ -1406,7 +1406,12 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
-    for (what, (n, us, longest)) in by.into_iter().take(40) {
+    // (`VICTORY_GPU_TIMING_TOP=<n>`: how many kinds, 40 by default; the rest
+    // of a frame's time is a long tail of small ones, 37 of 70 ms in run
+    // 222355.)
+    static TOP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let top = *TOP.get_or_init(|| std::env::var("VICTORY_GPU_TIMING_TOP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(40));
+    for (what, (n, us, longest)) in by.into_iter().take(top) {
         tracing::info!(
             "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
             us as f64 / 1e3 / frames,
