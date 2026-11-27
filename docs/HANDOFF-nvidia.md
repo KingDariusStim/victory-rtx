@@ -1,5 +1,7 @@
 # Handoff: the NVIDIA work (2026-11-25)
 
+> **Start at the last section, "Start here: handoff of 2026-11-27, 11:15".** Everything before it is history, in the order it happened.
+
 Where the NVIDIA effort stands, what was measured, what is broken, what to do next, and the
 quirks that cost time. Written for whoever picks this up next, human or agent. Everything here
 was measured on one PC; numbers from other machines are labelled.
