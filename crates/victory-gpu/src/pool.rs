@@ -850,7 +850,7 @@ mod tests {
             ..Default::default()
         };
         // SAFETY: a valid description.
-        let Some(t) = (unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) }) else { return };
+        let Some(t) = (unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON, None) }) else { return };
         assert_eq!(crate::host::references(&t), 1, "what the texture holds is no reference to it");
         let resting = || lock(&TEXTURES).resting.len();
         let before = resting();

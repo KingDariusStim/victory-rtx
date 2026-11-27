@@ -159,6 +159,80 @@ impl Extents {
     }
 }
 
+/// The dynamic slots in two zones (`VICTORY_TABLE_ZONES=<short max>,<short
+/// zone percent>`; unset: one zone, as before): tables of up to `short`
+/// slots from the first part, longer ones from the rest, each zone next fit
+/// as [`Extents`]; a table whose zone has no stretch for it takes one in
+/// the other. In one zone the world's ~7,500 tables a frame of 2-6 slots,
+/// given back out of order, cut the pool into crumbs: 16,000-36,000 slots
+/// free in 7,000-9,000 stretches, the longest 19-80, and tables of 29 and
+/// more refused (their draws dropped: run 100542, black bodies and stray
+/// triangles growing with play).
+pub(crate) struct Zones {
+    short: Extents,
+    long: Extents,
+    /// The first slot of the long zone (0: one zone, `long` only).
+    split: u32,
+    short_max: u32,
+}
+
+impl Zones {
+    pub(crate) fn new(slots: u32) -> Zones {
+        let asked = std::env::var("VICTORY_TABLE_ZONES").ok().and_then(|v| {
+            let (a, b) = v.trim().split_once(',')?;
+            Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?))
+        });
+        let (short_max, split) = match asked {
+            Some((max, percent)) if max > 0 && (5..=95).contains(&percent) => {
+                (max, (u64::from(slots) * u64::from(percent) / 100) as u32)
+            }
+            _ => (0, 0),
+        };
+        if split > 0 {
+            tracing::info!(short_max, short_slots = split, long_slots = slots - split, "dynamic slots in two zones (VICTORY_TABLE_ZONES)");
+        }
+        Zones { short: Extents::new(split), long: Extents::new(slots - split), split, short_max }
+    }
+
+    pub(crate) fn free_slots(&self) -> u32 {
+        self.short.free_slots() + self.long.free_slots()
+    }
+
+    /// Free stretches over both zones, and the longest.
+    pub(crate) fn census(&self) -> (u32, u32) {
+        let (a, b) = (self.short.census(), self.long.census());
+        (a.0 + b.0, a.1.max(b.1))
+    }
+
+    pub(crate) fn take(&mut self, n: u32) -> Option<u32> {
+        if self.split == 0 {
+            return self.long.take(n);
+        }
+        let long = |z: &mut Self| z.long.take(n).map(|at| at + z.split);
+        if n <= self.short_max {
+            self.short.take(n).or_else(|| long(self))
+        } else {
+            long(self).or_else(|| self.short.take(n))
+        }
+    }
+
+    pub(crate) fn give(&mut self, first: u32, n: u32) {
+        if first >= self.split {
+            self.long.give(first - self.split, n);
+        } else {
+            self.short.give(first, n);
+        }
+    }
+
+    pub(crate) fn holds(&self, slot: u32) -> Option<bool> {
+        if slot >= self.split {
+            self.long.holds(slot - self.split)
+        } else {
+            self.short.holds(slot)
+        }
+    }
+}
+
 /// The long tables' slots: only the offsets their readers name.
 ///
 /// A translated shader reads a table's entry at the heap index of the
@@ -416,5 +490,29 @@ mod tests {
             }
         }
         assert!(e.take(2000).is_some(), "a long stretch is left: {:?}", e.census());
+    }
+
+    #[test]
+    fn zones_keep_short_tables_apart_and_borrow_when_full() {
+        let mut z = Zones { short: Extents::new(100), long: Extents::new(100), split: 100, short_max: 8 };
+        // Short tables from the short zone, long ones from the long zone.
+        assert_eq!(z.take(4), Some(0));
+        assert_eq!(z.take(30), Some(100));
+        // The short zone full: a short table borrows from the long zone.
+        for _ in 0..24 {
+            assert!(z.take(4).is_some_and(|at| at < 100));
+        }
+        assert!(z.take(4).is_some_and(|at| at >= 100));
+        // Given back on either side of the split, and taken again.
+        z.give(0, 4);
+        assert_eq!(z.take(4), Some(0));
+        z.give(100, 30);
+        // (The borrowed short table lies at 130..134: the 60 go after it.)
+        assert_eq!(z.take(60), Some(134));
+        assert_eq!(z.free_slots(), 200 - 100 - 60 - 4);
+        // One zone when not asked for.
+        let mut one = Zones { short: Extents::new(0), long: Extents::new(50), split: 0, short_max: 0 };
+        assert_eq!(one.take(4), Some(0));
+        assert_eq!(one.holds(0), Some(true));
     }
 }

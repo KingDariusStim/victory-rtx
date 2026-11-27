@@ -161,7 +161,7 @@ pub(crate) struct HostHeap {
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
     /// The dynamic slots' free stretches, best fit (`super::slab::Extents`;
     /// what came before it and how it did is told there).
-    runs: Mutex<super::slab::Extents>,
+    runs: Mutex<super::slab::Zones>,
     /// The last part of the dynamic slots, for long tables, placed by the
     /// offsets they read (`super::slab::Sparse`), and where it starts.
     sparse: Mutex<super::slab::Sparse>,
@@ -1716,7 +1716,7 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            runs: Mutex::new(super::slab::Extents::new(extra - sparse_zone(extra))),
+            runs: Mutex::new(super::slab::Zones::new(extra - sparse_zone(extra))),
             sparse: Mutex::new(super::slab::Sparse::new(sparse_zone(extra))),
             sparse_from: extra - sparse_zone(extra),
             strides,
