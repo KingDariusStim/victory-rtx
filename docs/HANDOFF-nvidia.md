@@ -1079,3 +1079,111 @@ own fluorescent flicker. Barriers (`VICTORY_BARRIER_TEST=groups`, run 092848) an
 the card (run 094146) do not change the frame rate. In play the PC has ~1 GB of RAM free (26.3 GB
 private of 32): a paging and blue-screen risk. Windows automatic updates are off by policy at the
 user's request (the 02:44 restart was the 26H2 feature update, not a crash).
+
+## Start here: handoff of 2026-11-27, 11:15
+
+Written for whoever continues (a person or another Claude session). Everything above this section
+is history; this section is the current state. The user reports that the game "seems to be
+regressing", so the first job is to re-establish a known-good baseline before changing anything.
+
+### The machine and where things are
+
+- RTX 2080 SUPER (8 GB), 32 GB RAM, Windows 11 26H2 (feature update installed 02:44 today; D3D12Core
+  26100.9818). Automatic Windows updates are **off by policy** at the user's request
+  (`HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`: `NoAutoUpdate=1`,
+  `NoAutoRebootWithLoggedOnUsers=1`, `AUOptions=2`; undo by deleting the `WindowsUpdate` key).
+  Pagefile 16-32 GB, GPU timeout (TdrDelay) 10 s.
+- Branch `rtx-next` of github.com/KingDariusStim/victory-rtx, checkout `victory_repo/victory-xtx`.
+  Run kit `tools/runkit` (`Run-Victory.ps1 -Fast -Book -Console series-s`), settings in the
+  git-ignored `tools/runkit/settings.local.ps1`, cache `F:\victory-cache-xtx`, logs and shots in
+  `victory-data`. After a translator change or a driver/D3D12 update: `-Mode warm` first.
+- Other checkouts: `victory-merge` (branch `port6-try`, pushed as `rtx-next-experiments`: upstream
+  renderer port 6, the `VICTORY_OUTPUT` output-size patch, `VICTORY_SKIP_HAIR`, cool_fox's pipeline
+  library store-later), `victory-coolfox` (DoubleGhosty/cool_fox; crashes here, see below),
+  `victory-upstream`, `victory-cp`, `VIctory-main` (superseded; `F:\victory-cache` is its stale cache,
+  1.3 GB, safe to delete by hand).
+
+### Baseline to start from (the user's eyes, not only the logs)
+
+Last night at 22:15 the user said "the game looks amazing" on run 220752: `rtx-next` 302d660 with
+`settings.local.ps1` as it is now (texture budget 2048, port 5, buffer copies on the card). Since
+then one code change is confirmed good and is on by default:
+
+- **235926b, per-draw slots released when the card has run a flight** (`VICTORY_EARLY_TABLES=0`
+  turns it off). Before: in play the 262,144 dynamic descriptor slots ran out (19,000-29,000 free,
+  285-550 tables refused per report, their draws dropped: flickering triangles, black or see-through
+  bodies, getting worse with play). After, with the user playing the same part (run 104607):
+  192,000-211,000 free, no table refused. The card refuses any view heap above exactly 1,000,000
+  views, so the pool cannot grow; returning slots sooner was the lever.
+
+Everything else from today is behind switches and **off** in `settings.local.ps1` now:
+`VICTORY_TABLE_ZONES` (two-zone slot allocator, d967534: no measured benefit alone),
+`VICTORY_TEXTURE_GUARD=0` (see below), `VICTORY_BVH_BUILDER=1`, `VICTORY_SKIP_HAIR`, the ports.
+
+**First step for the next session:** one run of the baseline with the user watching the opening
+(the club scene about 120-170 s after launch, the window shot, the dorm the cutscene walks into, an
+inmate conversation) and their verdict on what regressed relative to last night, with timestamps.
+Then change one switch per run.
+
+### Open problems, each with what is known
+
+1. **Black faces** (the waitress in the club; glowing eyes in the diner). Conflicting evidence: the
+   user's 10:49 screenshots (run 24, guard on) had a black face; run clubA minutes later (guard off)
+   rendered the same face right; the user also said run 24's "textures looked better". cool_fox's
+   launcher sets `VICTORY_TEXTURE_GUARD=0` for "garbage skins and black faces". Not settled: A/B the
+   guard on the club scene, two runs each (scratchpad `club.sh <tag> "<-Set>"` captures it 4 times a
+   second). The three GPU block-compression programs (477b52e7, 17af85f1, 8b437ab6; translated in an
+   APPROXIMATE half-wave form since 302d660) did not cause the black face (skipped in run clubB: faces
+   fine), but their output is approximate; `VICTORY_SKIP_PIPELINES` with the three hashes turns them
+   off if they are suspected in another texture problem.
+2. **Colour banding ("watercolor")**: lit walls break into flat bands with green/purple tints in dark
+   rooms (`shots/full23/144535.873.jpg`, `shots/clubB/145803.438.jpg`,
+   `shots/amb25full/150308.665.jpg`). Not the ambient stand-in (`VICTORY_AMBIENT=0`: still there), not
+   the screen-probe lighting (`VICTORY_BVH_BUILDER=1`: interiors and ray tracing look right per the
+   user, banding still there), not the compressors. Next suspect: the Series S profile's upscaler (the
+   title picks AMD FSR4 there; its INT8 network runs through our translated `dot4AddPacked` math).
+   Run 27 (Series X profile, the title's own upscaler, builder on) was started at 11:08 to test this:
+   see `shots/sx27`. If Series X is clean, compare the FSR4 network's translation
+   (8e614708143ef917) against WARP, or force the title's upscaler (`VICTORY_UPSCALER=6`, on the
+   experiments branch, from upstream's `resolution.rs`).
+3. **Flickering triangles**: the slot starvation above was the main source (fixed). A second
+   candidate remains: the title's VFX triangle heap defragments on the card with
+   `vfx_triangleClip:CS_DefragHeap_ComputeRelocations` (02384a60), which the card refuses (it needs
+   64-lane waves) and which is dropped every frame, while the follow-up
+   `RelocateVfxStartIndexLocation` (339d476c) still runs. Skipping the follow-up (run 100542) did not
+   end the triangles on its own, but that run still had the slot starvation: retest with 235926b.
+   cool_fox's translation of 02384a60 (Davidjc13, c36f9f4 and ca7e21a) panics here and crashes the
+   title (run 100138): do not take it as it is.
+4. **Shadow glitches every few seconds**: reported by the user, not yet looked at.
+5. **Frame rate**: 9-11 fps at the window shot, GPU-bound (the card about 96-98% busy; 64-70 ms of
+   commands a frame over about 8,000 commands, no kind above 5 ms, 3,000 of them under 20 us).
+   Measured and not a lever on this card: barriers, more title memory on the card, output size (the
+   Series X patch works: no 4K target, same fps), levels on demand (worse), ports 1 and 6 (port 6 cuts
+   the title threads' guard waits from 19.5 to 0.4 ms; fps unchanged). Strand hair is about 15 ms:
+   `VICTORY_SKIP_HAIR=1` gives 12-14 fps but removes Lucia's ponytail. 20 fps needs the card's work
+   cut by half; 30 is not in sight on a 2080 SUPER.
+6. **RAM**: in play the process holds about 26 GB private and the PC has about 1 GB free: paging, and
+   the conditions of the 0x1A blue screen of 11-26. 3.2 GB of it are copies of title-memory windows
+   kept in PC memory.
+7. **Controller**: the runtime reads XInput (slots 0-3) and falls back to keyboard-as-gamepad when no
+   pad is connected (`victory-hle` `gameinput.rs`). The user's Xbox One S pad (Bluetooth, PID 02E0)
+   is paired with its XInput driver loaded, but XInput reported every slot "not connected" (error
+   1167) through a minute of polling: a Windows or controller issue (asleep, firmware, or try a USB
+   cable), not the game. Until then the user plays with the keyboard (WASD left stick, Enter = A).
+
+### Tools made today (scratchpad of session e901abe5; copy anything worth keeping)
+
+`club.sh` (a 4-minute run capturing the club scene 4 times a second), `flick.ps1` (frames that
+differ from both neighbours), `tilej.ps1` (contact sheets of jpg captures), `sum.sh` (a run's fps,
+memory, texture queue, targets, device loss), `Drive-Run.ps1`, `Press-Key.ps1`, `shots3.ps1` (run
+driver, held keys, timed window captures). The log lines that matter: "recording per frame ...
+dynamic slots: N tables asked, M refused", "dynamic slots now: F free in S stretches, the longest
+L", "memory of textures", "the card's clock per frame".
+
+### Rules learned the hard way
+
+- The user plays the runs live: **never close a run without asking** (run 24 was closed under them).
+- Never start a run while an earlier driver is still active: a stale `Drive-Run` stops the next
+  game. Kill drivers by command line first.
+- `taskkill` from Git Bash needs `//F //PID`.
+- The tools refuse to delete a top-level folder on a drive.
