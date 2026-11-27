@@ -1044,3 +1044,38 @@ shadows: ~8,000 commands a frame) and it is the same at 720p internal / 1080p ou
 against 10-11, 1,082 draws a frame dropped: the strand hair is worth about 15 ms of the card here.
 The price: Lucia's ponytail is gone, a scalp mesh remains (shots/hair17-016-0488s.png). An option for
 the user, not a default. With it and nothing else the card still needs ~45 ms a frame.
+
+## Flickering triangles and black bodies: per-draw slots fragment in play (2026-11-27 morning)
+
+The user saw flickering triangles in the dorm after the window shot, "worse and worse as time goes
+on". Captures at 4 a second (`shots/tri1`, `tri2`; scratchpad `flick.ps1` scores frames that differ
+from both neighbours): a dark slab out of the top bunk for half a second, and Lucia's body drawn as a
+black silhouette with a glowing disc for a head for half a second (`tri2/141108.339.jpg`).
+
+**Cause found in the counters:** the per-draw ("dynamic") descriptor slots, 262,144 on this card's
+1,000,000-view heap, fragment during play. In run 100542 at 14:11: 16,000-36,000 slots free in
+7,000-9,000 stretches, the longest 19-80; tables of 29 slots and more refused, and `draw.rs` `bind`
+drops a draw whose table was refused. Refusals per report are ~0 in the scripted window shot and climb
+108 -> 675 once the user walks into the dorm (run 094146). Demand: ~7,500 fresh tables a frame, 45,000
+slots (average 6, mostly constant-buffer tables), 565 a frame past the title's 737,855 slots (so the
+title uses its whole share and the pool cannot grow on a 1,000,000-view heap).
+
+**Fix (commit d967534):** `descriptor/slab.rs` `Zones`, `VICTORY_TABLE_ZONES=<short max>,<short %>`:
+short tables in one part of the pool, long ones in the other, each next fit; a table whose zone is
+full borrows from the other. Unit-tested; `settings.local.ps1` now sets `8,50` and
+`VICTORY_TEXTURE_GUARD=0`. **Not yet verified in the dorm**: scripted keys do not move Lucia (W held 6 s
+eight times: she stays at the window), so the test is the user's next play session. What to read:
+the "recording per frame ... dynamic slots: N tables asked, M refused" and "dynamic slots now: free in
+stretches, the longest" lines while walking the dorm.
+
+Also tried this morning: the triangle heap's relocation passes skipped with the refused
+`ComputeRelocations` (run 100542, `VICTORY_SKIP_PIPELINES=339d476c...`): the user still saw triangles
+growing, so that alone is not it. cool_fox's tree (DoubleGhosty, Davidjc13's face-relocation path)
+crashed here at the first bind of that pass (run 100138: translator panic "use of a void value", then
+the title's null write at +0x23cf683). The wave-wide translator form turns three of the six refused
+programs into 32-lane ones offline (CS_Visibility, both water TransmissionVolumetrics); not enabled
+yet. The one-frame dark flashes in `tri1` (ceiling panels go dark with the room) look like the game's
+own fluorescent flicker. Barriers (`VICTORY_BARRIER_TEST=groups`, run 092848) and 2 GB of windows on
+the card (run 094146) do not change the frame rate. In play the PC has ~1 GB of RAM free (26.3 GB
+private of 32): a paging and blue-screen risk. Windows automatic updates are off by policy at the
+user's request (the 02:44 restart was the 26H2 feature update, not a crash).
