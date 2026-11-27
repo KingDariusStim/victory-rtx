@@ -18,6 +18,7 @@
 pub(crate) mod ahead;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -190,7 +191,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             Some(through) => through.clone(),
             None => {
                 // SAFETY: live textures.
-                let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
+                let (of_from, of_to) = unsafe { (crate::resource::query_desc(from.GetDesc()), crate::resource::query_desc(to.GetDesc())) };
                 // Levels times layers (a volume's slices are one part).
                 let count = |d: &D3D12_RESOURCE_DESC| {
                     let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
@@ -633,12 +634,70 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
-/// Whether `resource`'s host copy takes its contents from title memory:
-/// a texture the host GPU does not render to or write.
-pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
-    const TARGET_DEPTH_UNORDERED: i32 = 0x7;
-    // SAFETY: a live resource.
-    unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
+/// Textures the title placed in its memory whose unordered views the host
+/// made on their host copies (`crate::descriptor::host` `placed_texture_uav`:
+/// block-compressed material textures the title's compute shaders write),
+/// not yet given to a list: the next dispatch bound on any list takes them
+/// ([`card_writers_bound`]). The title writes such a view into its heap and
+/// dispatches the writer, which picks the slot by index: no table names
+/// the view, so the writer is not known, and the dispatch recorded next is
+/// taken for it.
+static CARD_WRITERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Whether [`CARD_WRITERS`] holds any (asked at every dispatch).
+static CARD_WRITERS_ANY: AtomicBool = AtomicBool::new(false);
+/// Diagnostics: unordered views of placed textures made on host copies, the
+/// textures taken by dispatches, the uploads recorded for them first.
+pub(crate) static CARD_WRITER_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// An unordered view of placed texture `resource` was made on its host copy.
+pub(crate) fn placed_uav_made(resource: This) {
+    CARD_WRITER_STATS[0].fetch_add(1, Ordering::Relaxed);
+    let mut writers = CARD_WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    if !writers.contains(&(resource as usize)) {
+        writers.push(resource as usize);
+        CARD_WRITERS_ANY.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A dispatch of `pipeline` is being bound on `list`: the placed textures
+/// with new unordered views ([`placed_uav_made`]) are the card's from here
+/// on. Each is uploaded from title memory once more into this list, ahead
+/// of the dispatch (what the title put there before the shader writes, if
+/// anything), then noted as written by the host ([`host_written`]: no
+/// upload from title memory again, which would undo the shader's writes),
+/// and moved to the unordered access state in this list.
+pub(crate) fn card_writers_bound(list: &HostList, pipeline: &str) {
+    if !CARD_WRITERS_ANY.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let taken = std::mem::take(&mut *CARD_WRITERS.lock().unwrap_or_else(|e| e.into_inner()));
+    const UNORDERED_ACCESS: u32 = 0x8;
+    for resource in taken {
+        let resource = resource as This;
+        CARD_WRITER_STATS[1].fetch_add(1, Ordering::Relaxed);
+        if !host_wrote(resource as usize) {
+            CARD_WRITER_STATS[2].fetch_add(1, Ordering::Relaxed);
+            upload_from(list, resource, 0);
+            host_written(resource);
+        }
+        crate::list::ensure_state(list, resource, UNORDERED_ACCESS);
+        static SAID: Mutex<std::collections::BTreeSet<String>> = Mutex::new(std::collections::BTreeSet::new());
+        if let Some((_, desc)) = crate::resource::texture_memory(resource) {
+            // SAFETY: 56 bytes in the description's layout.
+            let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
+            let key = format!(
+                "{pipeline} writes {}x{} f{} levels {}",
+                words[4],
+                words[6],
+                words[8],
+                words[7] >> 16
+            );
+            let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+            if said.len() < 48 && said.insert(key.clone()) {
+                tracing::info!(%key, "a placed texture with an unordered view the host made is written by the dispatch bound next");
+            }
+        }
+    }
 }
 
 /// Records, once per list, the copy of `resource`'s staging buffer into
@@ -944,7 +1003,7 @@ impl Drop for Claimed {
 /// the copy destination state.
 pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12Resource) {
     // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
+    let d = crate::resource::query_desc(unsafe { texture.GetDesc() });
     let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { u32::from(d.DepthOrArraySize) };
     let count = u32::from(d.MipLevels) * layers;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
@@ -1776,7 +1835,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     }
     let host = host()?;
     // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
+    let d = crate::resource::query_desc(unsafe { texture.GetDesc() });
     let level0 = copy.base;
     let mips = level0 + u32::from(d.MipLevels);
     let first = crate::resource::read_from(&layout, first).max(level0).min(mips - 1);

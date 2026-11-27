@@ -478,7 +478,7 @@ fn where_the_card_reads(heap: &ID3D12Heap, texture: &ID3D12Resource, piece: Piec
     };
     let into = base - block - piece.start;
     // SAFETY: a live texture.
-    let desc = unsafe { texture.GetDesc() };
+    let desc = crate::resource::query_desc(unsafe { texture.GetDesc() });
     // The first level's bytes, as a copy would have them.
     let mut level = 0u64;
     if let Some(host) = crate::host::made_host() {
@@ -598,8 +598,10 @@ fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
     }
 }
 
-/// A texture of `desc` (no target, depth or unordered access) in a block;
-/// `None`: not pooled, or the host refused.
+/// A texture of `desc` (no target or depth) in a block; `None`: not pooled,
+/// or the host refused. `castable`: a block-compressed texture the title's
+/// compute shaders write (`crate::resource::block_alias`), made castable to
+/// that format in the common layout (`state` must be the common state).
 ///
 /// # Safety
 /// `desc` is a valid description.
@@ -607,6 +609,7 @@ pub(crate) unsafe fn texture(
     device: &ID3D12Device,
     desc: *const D3D12_RESOURCE_DESC,
     state: D3D12_RESOURCE_STATES,
+    castable: Option<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT>,
 ) -> Option<ID3D12Resource> {
     if !on() {
         return None;
@@ -617,11 +620,13 @@ pub(crate) unsafe fn texture(
     // SAFETY: the caller's description.
     let mut d = unsafe { *desc };
     d.Alignment = if small_placement() { u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) } else { 0 };
+    // (Asked without the unordered access a castable block-compressed
+    // texture has: `crate::resource::query_desc`.)
     // SAFETY: plain queries.
-    let mut info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
+    let mut info = unsafe { device.GetResourceAllocationInfo(0, &[crate::resource::query_desc(d)]) };
     if info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment {
         d.Alignment = 0;
-        info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
+        info = unsafe { device.GetResourceAllocationInfo(0, &[crate::resource::query_desc(d)]) };
     }
     if info.SizeInBytes == u64::MAX {
         return None;
@@ -650,7 +655,17 @@ pub(crate) unsafe fn texture(
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
-    let result = unsafe { device.CreatePlacedResource(&heap, piece.start, &d, state, None, &mut made) };
+    // SAFETY: as above.
+    let result = match castable.filter(|_| state == D3D12_RESOURCE_STATE_COMMON) {
+        Some(format) => match device.cast::<ID3D12Device10>() {
+            Ok(device10) => unsafe {
+                let d1 = crate::resource::desc1(&d);
+                device10.CreatePlacedResource2(&heap, piece.start, &d1, D3D12_BARRIER_LAYOUT_COMMON, None, Some(&[format]), &mut made)
+            },
+            Err(e) => Err(e),
+        },
+        None => unsafe { device.CreatePlacedResource(&heap, piece.start, &d, state, None, &mut made) },
+    };
     match (result, made) {
         (Ok(()), Some(made)) => {
             HELD.fetch_add(piece.len, Ordering::Relaxed);

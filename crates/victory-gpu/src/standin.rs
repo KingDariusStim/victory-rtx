@@ -218,7 +218,7 @@ fn extent(texture: &ID3D12Resource, sub: u32) -> Option<[u32; 3]> {
     let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     // SAFETY: a live texture; one footprint into our own structure.
     unsafe {
-        let desc = texture.GetDesc();
+        let desc = crate::resource::query_desc(texture.GetDesc());
         host.device.GetCopyableFootprints(&desc, sub, 1, 0, Some(&mut layout), None, None, None);
     }
     let f = layout.Footprint;

@@ -251,6 +251,67 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// The uncompressed UINT format whose element is one block of block-compressed
+/// `format`: R32G32_UINT (17) for the 64-bit blocks of BC1 and BC4,
+/// R32G32B32A32_UINT (3) for the 128-bit blocks of BC2, BC3, BC5, BC6H and
+/// BC7; `None` for other formats. The console's compute shaders write
+/// block-compressed textures through unordered views (the title's material
+/// textures: skin, walls, 2,000-4,000 such views a run); the host can only
+/// through a view in this format, on a texture made castable to it
+/// (`host_texture_as`, relaxed format casting). `VICTORY_BC_WRITES=0`: none
+/// (such views are null, as before, and what shaders write through them is
+/// lost).
+pub(crate) fn block_alias(format: u32) -> Option<u32> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_BC_WRITES").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    match format {
+        70..=72 | 79..=81 => Some(17),
+        73..=78 | 82..=84 | 94..=99 => Some(3),
+        _ => None,
+    }
+}
+
+/// `d` as the footprint and allocation queries take it: a block-compressed
+/// texture made writable for the title's compute shaders ([`block_alias`])
+/// has unordered access, which the queries refuse on such a format (they
+/// know nothing of the castable formats; every byte count came back as
+/// `u64::MAX`, and no texture uploaded, run 211202): asked without it,
+/// which changes no footprint.
+#[cfg(windows)]
+pub(crate) fn query_desc(
+    mut d: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+) -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS as UAV;
+    if d.Flags.0 & UAV.0 != 0 && block_alias(d.Format.0 as u32).is_some() {
+        d.Flags.0 &= !UAV.0;
+    }
+    d
+}
+
+/// `desc` as the description the layout-based creation calls take
+/// (`CreateCommittedResource3`, `CreatePlacedResource2`): the same fields
+/// and no sampler feedback region.
+#[cfg(windows)]
+pub(crate) fn desc1(
+    d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+) -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC1 {
+    windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC1 {
+        Dimension: d.Dimension,
+        Alignment: d.Alignment,
+        Width: d.Width,
+        Height: d.Height,
+        DepthOrArraySize: d.DepthOrArraySize,
+        MipLevels: d.MipLevels,
+        Format: d.Format,
+        SampleDesc: d.SampleDesc,
+        Layout: d.Layout,
+        Flags: d.Flags,
+        SamplerFeedbackMipRegion: Default::default(),
+    }
+}
+
 /// The format of a texture the host GPU renders to or writes as unordered
 /// access, for the title's `format`. The console's GPU does both with the
 /// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and
@@ -1199,6 +1260,10 @@ pub(crate) struct HostTexture {
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
+    /// A block-compressed texture made castable to the UINT format of its
+    /// blocks ([`block_alias`]), for the unordered views the title's compute
+    /// shaders write it through: that format, 0 for none.
+    pub(crate) alias: u32,
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -2367,7 +2432,7 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
     };
     // SAFETY: plain queries on a live resource and device.
     unsafe {
-        let desc = texture.GetDesc();
+        let desc = query_desc(texture.GetDesc());
         host.device.GetResourceAllocationInfo(0, &[desc]).SizeInBytes
     }
 }
@@ -2378,11 +2443,25 @@ impl HostTexture {
         self.flags
     }
 
+    /// Whether the title fills the texture itself ([`fills`]: no target,
+    /// depth or unordered access in the title's description). Asked of the
+    /// title's flags, not the host texture's: a block-compressed copy made
+    /// writable for the title's compute shaders ([`HostTexture::alias`]) has
+    /// unordered access the title's description has not.
+    pub(crate) fn title_filled(&self) -> bool {
+        self.filled
+    }
+
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
         // SAFETY: a live texture.
-        let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
+        let d = unsafe { texture.GetDesc() };
+        let flags = d.Flags.0 as u32;
+        // (A block-compressed texture has unordered access only if the host
+        // made it castable to its blocks' format.)
+        const UNORDERED: u32 = 0x4;
+        let alias = if flags & UNORDERED != 0 { block_alias(d.Format.0 as u32).unwrap_or(0) } else { 0 };
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
@@ -2397,6 +2476,7 @@ impl HostTexture {
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
+            alias,
         }
     }
 
@@ -2422,6 +2502,7 @@ impl HostTexture {
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
+            alias: 0,
         }
     }
 }
@@ -2516,6 +2597,7 @@ fn host_texture_as(
     reserved: bool,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
         return None;
@@ -2576,6 +2658,25 @@ fn host_texture_as(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    // A block-compressed 2D texture the title fills, which its compute
+    // shaders may also write through an unordered view (`block_alias`):
+    // made castable to the UINT format of its blocks, with unordered
+    // access, so that such a view can be made on it
+    // (`crate::descriptor::host` `placed_texture_uav`). Made in the common
+    // layout, which is the common state: only textures created in it.
+    const TEXTURE_2D: u32 = 3;
+    let alias = (!reserved
+        && fills(desc)
+        && d.dimension == TEXTURE_2D
+        && d.sample_count <= 1
+        && clear_value.is_none()
+        && crate::host::legal_for(d.flags, crate::host::texture_state(state)) == 0)
+        .then(|| block_alias(d.format))
+        .flatten()
+        .map(|f| windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f as i32));
+    if alias.is_some() {
+        d.flags |= UNORDERED;
+    }
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
@@ -2589,6 +2690,7 @@ fn host_texture_as(
                 &host.device,
                 (&raw const d).cast(),
                 D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32),
+                alias,
             )
         }
     {
@@ -2610,6 +2712,24 @@ fn host_texture_as(
                     crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
                 ),
                 None,
+                &mut texture,
+            )
+        }
+    } else if let Some(alias) = alias
+        && let Ok(device10) = host.device.cast::<ID3D12Device10>()
+    {
+        // SAFETY: the description has the host layout (checked size, same
+        // fields); a texture the title fills has no clear value.
+        unsafe {
+            let d1 = desc1(&*(&raw const d).cast::<D3D12_RESOURCE_DESC>());
+            device10.CreateCommittedResource3(
+                &heap,
+                crate::host::not_resident(),
+                &d1,
+                D3D12_BARRIER_LAYOUT_COMMON,
+                None,
+                None::<&ID3D12ProtectedResourceSession>,
+                Some(&[alias]),
                 &mut texture,
             )
         }

@@ -1161,6 +1161,15 @@ fn words_for(view: View) -> [u32; 2] {
             }
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
+                // Diagnostics (run 212911): unordered views of placed textures reach
+                // the records without the device method being called for them:
+                // who makes them (the first two, with a backtrace).
+                if *unordered && resource[0] != 1 {
+                    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if SAID.fetch_add(1, Relaxed) < 2 {
+                        tracing::info!(?resource, ?desc, backtrace = %std::backtrace::Backtrace::force_capture(), "an unordered view of a placed texture is recorded");
+                    }
+                }
                 if address >> PLACED_ADDRESS_BITS == 0 {
                     // Nearly every placed view has a shape seen before.
                     let known = views_read().shape_index.get(&shape).copied();
@@ -1461,10 +1470,25 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
+    let (resource_ptr, desc_ptr) = (resource, desc);
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        // (For comparison with the unordered views': the first few texture
+        // views whole, with the words after each description.)
+        const BUFFER: u32 = 1;
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if resource[0] != BUFFER && SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            // SAFETY: as in `create_placed_uav`.
+            let around = unsafe { resource_ptr.cast::<[u32; 24]>().read_unaligned() };
+            let more = unsafe { desc_ptr.cast::<[u32; 24]>().read_unaligned() };
+            tracing::info!(resource = ?around, view = ?more, "a shader view of placed texture memory, as the title describes it (24 words each)");
+        }
         record(handle, View::Placed(false, resource, desc));
     }
 }
+
+/// Unordered views of placed memory the title asked for through the device
+/// method: of buffers, of textures (diagnostics).
+pub(crate) static PLACED_UAVS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 pub(crate) extern "system" fn create_placed_uav(
     _: This,
@@ -1472,7 +1496,33 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    let (resource_ptr, desc_ptr) = (resource, desc);
+    if let (Some(resource), Some(mut desc)) = (words(resource), words(desc)) {
+        PLACED_UAVS[usize::from(resource[0] != 1)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The first few, whole: where the title's unordered view of placed
+        // memory keeps the memory address (the shader views keep it in
+        // words 10 and 11; the unordered views of textures had zeros there,
+        // run 211640, and every such view was refused for want of it).
+        const BUFFER: u32 = 1;
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if resource[0] != BUFFER && SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            // (With the words after the resource description and after the
+            // view's: the texture views had no address in the view's 16.)
+            // SAFETY: the title passes the descriptions; the words after
+            // them are its stack, readable.
+            let around = unsafe { resource_ptr.cast::<[u32; 24]>().read_unaligned() };
+            let more = unsafe { desc_ptr.cast::<[u32; 24]>().read_unaligned() };
+            tracing::info!(resource = ?around, view = ?more, "an unordered view of placed texture memory, as the title describes it (24 words each)");
+        }
+        // A texture's view with nothing in words 10 and 11: the address is
+        // taken from the first pair of words after them that holds one, and
+        // put where the host reads it.
+        if resource[0] != BUFFER && desc[10] == 0 && desc[11] == 0 {
+            if let Some(at) = [12, 14].into_iter().find(|&at| desc[at] != 0 || desc[at + 1] != 0) {
+                (desc[10], desc[11]) = (desc[at], desc[at + 1]);
+                (desc[at], desc[at + 1]) = (0, 0);
+            }
+        }
         record(handle, View::Placed(true, resource, desc));
     }
 }

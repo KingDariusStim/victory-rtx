@@ -970,7 +970,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             let same = windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from);
             // A source the title fills itself is uploaded first (upstream
             // PR #671): a copy read whatever the host texture held.
-            if crate::texture::title_written(from) {
+            if crate::resource::title_fills(src) {
                 crate::texture::upload(list, src, from);
             }
             // Depth textures shaders also write: what they wrote, first.
@@ -1152,7 +1152,7 @@ extern "system" fn copy_texture_region(
                 && dst.kind != FOOTPRINT
                 && src.footprint.offset as u32 == dst.footprint.offset as u32;
             list.twin_use(src.resource, false, false);
-            if crate::texture::title_written(texture) {
+            if crate::resource::title_fills(src.resource) {
                 crate::texture::upload(list, src.resource, texture);
             }
             if !same {
@@ -1181,7 +1181,7 @@ extern "system" fn copy_texture_region(
             Ok("title") => 1,
             _ => 2,
         });
-        if over != 0 && crate::texture::title_written(to) && !crate::texture::host_wrote(dst.resource as usize) {
+        if over != 0 && crate::resource::title_fills(dst.resource) && !crate::texture::host_wrote(dst.resource as usize) {
             // One a list uploaded, or a draw sampled, holds the title's.
             if over == 2 && !list.used(dst.resource as usize) && !crate::texture::is_staged(dst.resource) {
                 if let Some(host) = crate::host::host() {
@@ -1307,7 +1307,7 @@ fn read_back(
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
-    if crate::texture::title_written(texture) {
+    if crate::resource::title_fills(src.resource) {
         crate::texture::upload(list, src.resource, texture);
     }
     ensure_state(list, src.resource, COPY_SOURCE);

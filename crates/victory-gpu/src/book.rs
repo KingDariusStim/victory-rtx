@@ -325,7 +325,7 @@ pub(crate) fn made(resource: &ID3D12Resource, what: impl FnOnce() -> String) {
         return named(&object, what);
     }
     // SAFETY: a live resource.
-    let desc = unsafe { resource.GetDesc() };
+    let desc = crate::resource::query_desc(unsafe { resource.GetDesc() });
     let (start, size) = if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
         // SAFETY: as above.
         (Some(unsafe { resource.GetGPUVirtualAddress() }), desc.Width)
@@ -712,7 +712,7 @@ mod tests {
             ..Default::default()
         };
         // SAFETY: a valid description.
-        let texture = unsafe { crate::pool::texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) };
+        let texture = unsafe { crate::pool::texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON, None) };
         if let Some(texture) = texture {
             let at = texture_address(&texture, &desc);
             println!("address {at:x?}");

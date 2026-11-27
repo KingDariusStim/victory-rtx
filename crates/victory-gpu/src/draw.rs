@@ -1456,6 +1456,11 @@ impl State {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        // Placed textures with new unordered views: the card's from this
+        // dispatch on (`crate::texture::placed_uav_made`).
+        if compute {
+            crate::texture::card_writers_bound(list, &p.name);
+        }
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -2437,7 +2442,7 @@ impl State {
                 }
             };
             let texture = crate::resource::host_resource(resource);
-            let title_fills = texture.is_some_and(crate::texture::title_written);
+            let title_fills = texture.is_some() && crate::resource::title_fills(resource);
             if !title_fills {
                 at_once();
                 // a render target, a depth or unordered access texture: the host's own
@@ -4423,7 +4428,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
             if !aliased
                 && let Some(t) = crate::resource::host_copy(*resource as This)
-                && t.flags() & 0x7 == 0
+                && t.title_filled()
             {
                 // (A texture the title writes: no target, depth or unordered
                 // access, `crate::texture::title_written`.)

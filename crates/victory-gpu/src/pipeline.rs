@@ -159,6 +159,16 @@ impl Shader {
                         let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
                     }
                 }
+                // `VICTORY_SHADER_SAVE_REFUSED=<dir>`: only the shaders that do not
+                // translate, as the title gave them, for the translator's tools
+                // (`victory translate <file>`).
+                if done.is_err()
+                    && let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE_REFUSED")
+                {
+                    let dir = std::path::PathBuf::from(dir);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(dir.join(format!("{}.{}.cdxil", self.hash, self.stage)), &self.container);
+                }
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);

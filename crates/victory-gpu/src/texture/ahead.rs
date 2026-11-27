@@ -104,7 +104,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
     }
     if BYTES.load(Relaxed) >= MOST
-        || copy.flags() & 0x7 != 0
+        || !copy.title_filled()
         || copy.state.load(Relaxed) != 0
         || copy.grown.load(Relaxed)
         || copy.tiled.is_some()

@@ -148,7 +148,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
     let host = crate::host::host()?;
     let texture = &target.copy.texture;
     // SAFETY: a live texture kept through the command list's state tracking.
-    let desc = unsafe { texture.GetDesc() };
+    let desc = crate::resource::query_desc(unsafe { texture.GetDesc() });
     let mips = u32::from(desc.MipLevels.max(1));
     let subresources = mips * u32::from(desc.DepthOrArraySize.max(1));
     let n = subresources as usize;

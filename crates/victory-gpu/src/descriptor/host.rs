@@ -4515,22 +4515,23 @@ fn make_twinned(
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                // Each texture is said once (the first 64), with how many times
-                // such a view was asked for so far: what shaders write through
-                // them is lost.
-                static SAID: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
-                static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let times = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let at = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-                if (said.len() < 64 && said.insert(at)) || times.is_power_of_two() {
-                    tracing::warn!(
-                        address = format_args!("{at:#x}"),
-                        times,
-                        "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
+                if *unordered {
+                    return placed_texture_uav(device, resource, desc, at);
+                }
+                // A shader view of a placed texture the host has no
+                // resource for: at address 0 (the title's own null views:
+                // every "placed unordered texture view not mirrored" line
+                // of runs up to 212911 was one of these, read through the
+                // unordered arm) or at memory no texture can be made at.
+                // Null, counted; the first few said.
+                static UNMADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = UNMADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n <= 4 || n.is_power_of_two() {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    tracing::info!(
+                        address = format_args!("{address:#x}"),
+                        times = n,
+                        "placed shader view of a texture the host has no resource for (null): resource {resource:?}, view {:?}",
                         &desc[..10]
                     );
                 }
@@ -4552,6 +4553,96 @@ fn make_twinned(
             }
         }
     }
+}
+
+/// An unordered view of a texture the title placed in its memory
+/// (`View::Placed(true, ..)`, the console's device method 0x238), on the
+/// texture's host copy. The title's compute shaders write their material
+/// textures so (block-compressed: BC7 albedo, BC1 and BC4 masks, with mip
+/// chains, 2,000-4,000 views a run), picking the slot by index. The view's
+/// words are laid out as the console's placed shader views are (format,
+/// dimension, component mapping, a pad, then the level, a level count, the
+/// plane), not as a PC unordered view.
+/// A block-compressed texture gets the view in the UINT format of its
+/// blocks on a host copy made castable to it (`crate::resource::block_alias`;
+/// relaxed format casting: the view's level is the blocks of the texture's).
+/// Another format gets its own view if the host copy allows unordered
+/// access (the title's description asked for it). The texture is then the
+/// card's: `crate::texture::placed_uav_made` has the next dispatch upload it
+/// once more, move it to the unordered access state and keep it from being
+/// uploaded again.
+/// Without a host copy or the access (said once for the first 64 textures,
+/// and at powers of two of such views), the slot is null and what shaders
+/// write through it is lost, as before.
+fn placed_texture_uav(
+    device: &ID3D12Device,
+    resource: &[u32; 14],
+    desc: &[u32; 16],
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<Kept> {
+    const TEXTURE_2D_VIEW: u32 = 4;
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let level = desc[4].min(15);
+    let refused = |why: &str| {
+        static SAID: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
+        static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let times = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        if (said.len() < 64 && said.insert(address)) || times.is_power_of_two() {
+            tracing::warn!(
+                address = format_args!("{address:#x}"),
+                times,
+                why,
+                asked = ?crate::descriptor::PLACED_UAVS.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)),
+                "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
+                &desc[..10]
+            );
+        }
+        None
+    };
+    if desc[1] != TEXTURE_2D_VIEW {
+        return refused("not a 2D view");
+    }
+    let Some(texture) = crate::resource::texture_at(address, resource) else {
+        return refused("no resource for the texture");
+    };
+    // The host copy holds the levels from the first one viewed on
+    // (`crate::resource::held_only`): this one among them.
+    crate::resource::want_level(texture, level);
+    let Some(copy) = crate::resource::host_copy(texture) else {
+        return refused("no host copy");
+    };
+    if level < copy.base {
+        return refused("the level is not held");
+    }
+    // SAFETY: a live texture.
+    let own = unsafe { copy.texture.GetDesc() };
+    if own.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+        return refused("the host copy has no unordered access");
+    }
+    let format = if copy.alias != 0 {
+        DXGI_FORMAT(copy.alias as i32)
+    } else {
+        let mut format = DXGI_FORMAT(crate::resource::pc_format(desc[0]) as i32);
+        if !fits(&copy.texture, Some(&mut format), true) {
+            return refused("a view the host does not allow");
+        }
+        format
+    };
+    let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_UAV {
+                MipSlice: level - copy.base,
+                PlaneSlice: 0,
+            },
+        },
+    };
+    // SAFETY: a live texture and a slot of our heap.
+    unsafe { device.CreateUnorderedAccessView(&copy.texture, None::<&ID3D12Resource>, Some(&view), at) };
+    crate::texture::placed_uav_made(texture);
+    Some(Some(copy.texture.clone()))
 }
 
 /// The view `desc` of a texture, of a host copy of its levels from `base`
@@ -4899,8 +4990,34 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
     crate::resource::want_level(texture, crate::resource::first_mip(desc));
+    // Diagnostics (the black material textures): a texture placed in
+    // memory that shaders write as a buffer (the title's block-compressing
+    // computes store 16-byte blocks into buffers: the texture's memory,
+    // for all the host knows). Its host copy is filled from title memory,
+    // which has those writes only if they were copied back. Counted
+    // ([`PLACED_IN_WRITTEN`]), the first 24 said.
+    if let Some(bytes) = crate::resource::placed_bytes(resource)
+        && let Some(shadow) = crate::shadow::peek(address, bytes)
+        && shadow.written()
+    {
+        let n = PLACED_IN_WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 24 || n.is_power_of_two() {
+            tracing::info!(
+                address = format_args!("{address:#x}"),
+                bytes,
+                in_place = shadow.in_place(),
+                times = n,
+                "a placed texture lies in buffer memory shaders wrote: resource {resource:?}, view {:?}",
+                &desc[..10]
+            );
+        }
+    }
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
+
+/// Placed texture views made in buffer memory shaders wrote (diagnostics,
+/// [`placed_texture`]).
+pub(crate) static PLACED_IN_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A null view of the kind `view` is, for a slot whose view the host
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader

@@ -889,3 +889,58 @@ the same `-Set`, and the first run builds pipelines in play for about four minut
 primes the driver's cache, not the library). The machine: 32 GB of RAM, the process 26-27 GB
 private in the world, a 16-32 GB pagefile set by the user on 2026-11-27 after the 0x1A blue
 screen; keep an eye on "the PC has N MB free" in the `memory:` line.
+
+## Target 1, re-examined (2026-11-26, 21:00-22:00, runs 211202-215xxx)
+
+**The lead above was a misread.** Every "placed unordered texture view not mirrored" line came from the
+`View::Placed` arm of `descriptor/host.rs` `make_twinned`, which sent any placed *texture* view that
+`placed_texture()` could not resolve into the unordered shortcut, flag or no flag. Those views were the
+title's own null placeholders: shader views (device method 0x230) at address 0, levels 15, in whatever
+format the slot had held (the lines always said `address=0x0`). A counter on the device methods now shows
+what the title asks for: through the first gameplay, 68 placed *buffer* unordered views and **0 texture
+ones** (`asked=[68, 0]` in the refusal line). The arm now checks the flag; the null shader views are
+counted and logged as "placed shader view of a texture the host has no resource for (null)".
+
+What is in the tree anyway, and stays (harmless, `VICTORY_BC_WRITES=0` turns it off):
+- `resource.rs` `block_alias`: BC1/BC4 -> R32G32_UINT, BC2/3/5/6/7 -> R32G32B32A32_UINT. Title-filled 2D
+  BC host copies are made castable to that format with unordered access (`CreatePlacedResource2` in
+  `pool.rs`, `CreateCommittedResource3` in `host_texture_as`; the card reports
+  `RelaxedFormatCastingSupported`, inbox D3D12Core 10.0.26100.9278; spec: a cast view of a compressed
+  resource has one level, which a UAV is). `HostTexture::alias` and `title_filled()` (the title's flags,
+  not the host's: the checks in `draw.rs`, `list.rs`, `ahead.rs` that meant "the title fills it" now ask
+  that). `descriptor/host.rs` `placed_texture_uav` makes such a view (the words are SRV-shaped: word 4 is
+  the level); `texture.rs` `placed_uav_made` / `card_writers_bound` (from `draw.rs` `bind`, compute) upload
+  the texture once more ahead of the dispatch, mark it `host_written`, move it to the unordered state.
+- **Pitfall, cost a run:** `GetCopyableFootprints` and `GetResourceAllocationInfo` refuse a BC description
+  with the unordered flag (they know nothing of castable formats): every byte count came back `u64::MAX`,
+  no BC texture uploaded, the texture accounting let everything go. `resource::query_desc` strips the
+  flag for every such query (`host_bytes`, `staging`, `alias`, `zeros`, `pool`, `standin`, `texback`,
+  `capture`, `book`).
+- `VICTORY_SHADER_SAVE_REFUSED=<dir>` (`pipeline.rs`): the containers of the shaders that do not
+  translate, for `victory translate --list --jobs 1 <file.cdxil>` offline (set `VICTORY_HOST_WAVE=32
+  VICTORY_WAVE_WHY=1`). While the game runs it locks `target\diag\victory.exe`: build with
+  `--target-dir target/tr` for the tools and copy the exe over afterwards.
+
+**The three refused computes translate now** (477b52e73ddeb6f2, 17af85f170e66f30, 8b437ab61d8008fe:
+INT8 dot-product networks, `v_dot4c_i32_i8`, groups of 64, that store 16-byte blocks with
+`buffer_store_dwordx4`; they are GPU block compressors writing *buffers*, which is the texture's memory
+for all the host knows). Two changes in `victory-shader` `emit/lower.rs`: `scc_some` answers per host
+wave in the local forms (`local_any`/`local_ok`; the refusal at 0x218 was a spin-wait "loop while some
+lane's flag is still unset", which each half waiting for its own lanes is exactly), and the constant
+lane-mask select no longer refuses in the local form (`console_lane` is known there). They come out in the
+"local waves (APPROXIMATE, any mask), without early-outs" form: each half of 32 reads its own lane 0 and
+lane 31 for the console's 0 and 63 (a `v_permlanex16` + `v_readlane 0/63` reduction). Bound in run 214346
+without a device loss; whether their blocks come out right is not seen yet (see below). The shader crate's
+tests: 293 pass; 3 hardware tests failed only because the game held the card ("device suspended").
+
+**Where the black textures stand now.** The computes write their blocks into buffers on the card;
+`shadow.rs` `gpu_writes` notes "another host copy of the same bytes (a texture in it) is not told". The
+texture host copy is filled from title memory, which gets the card's bytes only through the copy-back
+(`copy_back_with` -> `put_changed` -> `watch::landing` -> `writing` -> `descriptor::host::remapped`, which
+does make the placed texture slots there due again). A probe in `placed_texture` counts and logs
+"a placed texture lies in buffer memory shaders wrote" (`PLACED_IN_WRITTEN`). Next: read that count in
+the window shot; if textures do lie in written buffers, check that their slots are re-uploaded after the
+landing (the heap pass's "changed after its upload" path), and that the landing happens for those
+buffers at all (table-bound unordered buffer views of dispatches; `VICTORY_WRITE_SKIP`). If no texture
+lies in written memory, the black skin and walls have another cause (the texture budget cap
+`VICTORY_TEXTURE_BUDGET_MB`, slots "waiting for their memory", or the materials' other inputs).
