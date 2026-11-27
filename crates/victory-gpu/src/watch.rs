@@ -934,11 +934,6 @@ fn writes_timed(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(us
         return Some(known);
     }
     let mut guards_asked = false;
-<<<<<<< HEAD
-    // (View memory read-only by our hand: the kernel would refuse.)
-    let refused = guarded && light() && PROTECTED.any(first, last);
-    let pages = match if refused { None } else { stage(2, || kernel_written(first, last)) } {
-=======
     // (View memory read-only by our hand: the kernel would refuse. With
     // renderer port #6 also view memory known as such, [`VIEWS`].)
     let protected = guarded && light() && PROTECTED.any(first, last);
@@ -947,8 +942,7 @@ fn writes_timed(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(us
         port6_count(P6_NOT_ASKED, 1);
     }
     let refused = protected || viewed;
-    let pages = match if refused { None } else { kernel_written(first, last) } {
->>>>>>> 9d723e8 (Renderer port 6 (VICTORY_PORT_GUARD=1, off by default): the guards' lock shared by faults and refreshes, a block's claim held while its state changes; view memory not asked of the kernel)
+    let pages = match if refused { None } else { stage(2, || kernel_written(first, last)) } {
         Some(pages) => pages,
         None => {
             guards_asked = true;
@@ -957,10 +951,7 @@ fn writes_timed(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(us
             }
             #[cfg(feature = "diagnostics")]
             let guarding = std::time::Instant::now();
-<<<<<<< HEAD
-            let written = stage(3, || guard(first * PAGE, last * PAGE)).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
-=======
-            let mut written = guard(first * PAGE, last * PAGE).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
+            let mut written = stage(3, || guard(first * PAGE, last * PAGE)).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
             if written.is_none() && viewed {
                 // Not a view after all (other memory there now): forgotten as
                 // one, and the kernel asked as before.
@@ -970,7 +961,6 @@ fn writes_timed(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(us
                     written = Some(pages);
                 }
             }
->>>>>>> 9d723e8 (Renderer port 6 (VICTORY_PORT_GUARD=1, off by default): the guards' lock shared by faults and refreshes, a block's claim held while its state changes; view memory not asked of the kernel)
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
