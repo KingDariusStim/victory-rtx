@@ -38,7 +38,15 @@
 //! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker return
 //!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
 
-use crate::frame_rate::Patched;
+/// What became of a site (as upstream.s `frame_rate::Patched`, which this
+/// tree does not carry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Patched {
+    Done,
+    /// Its bytes are not the ones expected: left alone.
+    Differs,
+    Failed(&'static str),
+}
 
 /// Sizes the title has a display mode for (its own list, +0x615c0c0).
 pub const MODES: [(u32, u32); 5] = [(1280, 720), (1664, 936), (1920, 1080), (2560, 1440), (3840, 2160)];
