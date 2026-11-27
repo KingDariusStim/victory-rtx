@@ -1,5 +1,3 @@
-            let mut written = stage(3, || guard(first * PAGE, last * PAGE)).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
-    let pages = match if refused { None } else { stage(2, || kernel_written(first, last)) } {
 //! Which title memory the title wrote since a host copy took it (decision
 //! 0007, "Copies of title memory"). The runtime reserves title GPU memory
 //! with write watching (`victory-hle` xmem), so the kernel keeps a dirty bit
