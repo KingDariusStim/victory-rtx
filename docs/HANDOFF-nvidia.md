@@ -1031,3 +1031,11 @@ promptly (cool_fox saw it cure the rainbow forearms and black faces). Its cost i
 path, invisible while the card is the wall; once the card is faster it will show. Levels on demand
 is not usable here as it stands. The output-size patch does nothing on the Series S profile: run 16
 tries it on Series X.
+
+**Run 16 (000539, Series X profile, `VICTORY_OUTPUT=1920x1080 VICTORY_DISPLAY_MODE=1920x1080`, the
+experiments build):** the output-size patch works on Series X: not one 3840x2160 target (1,278 MB of
+targets: 1280x720 x88, 4096x4096 and 2048x8192 shadow maps), the card 7.37 of 7.22 GB, **10-11.9 fps,
+the card 57 ms a frame of 100**, 4,948 draws. So the 4K output passes were never the cost on this
+card: the card's time is per-object work (skinning, strand hair, the facial rig's graph ops, decals,
+shadows: ~8,000 commands a frame) and it is the same at 720p internal / 1080p output as at 4K. Run
+17 measures the strand hair's share with `VICTORY_SKIP_HAIR=1`.
