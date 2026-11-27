@@ -775,3 +775,117 @@ run still builds ~2,000 pipelines in play for four minutes (the D3D12 library wa
 the runs since; the warm's workers do not save the library, they only prime the driver's cache).
 Scripted W/A keys do not move Lucia at the window; the stick mapping is there
 (`gameinput.rs` `left_y`), so gameplay beyond the window needs a look at why.
+
+## Next, in this order (from the user, 2026-11-27, 01:45)
+
+The user's order: (1) skin and wall textures all or partially black, (2) 20 fps, (3) moving lips
+during dialogue, (4) the stuttering intro animation. The state of each and where to start.
+
+### Target 1: skin and wall textures all or partially black
+
+**Lead, with evidence: the title writes block-compressed textures on the GPU and we drop those
+writes.** Every run says "placed unordered texture view not mirrored (null: writes through it are
+lost)" for 2,048-4,096+ views (printed at powers of two). Their shapes in run 004023:
+BC7_UNORM (98) 1024x256 and 1024x512, BC7_UNORM_SRGB (99) 1024x1024, BC1 (71, 72) 256x256,
+512x512, 1024x1024, 256x32, BC4 (80) 256x256, with mip chains: material textures (albedo, masks),
+not render targets. The console lets a compute shader write a BC texture through an unordered
+view (as a UINT alias); D3D12 does not, and `descriptor/host.rs` `make` gives such a slot a null
+view (`View::Placed(true, ..)` of a texture, the `shortcut` comment). A texture never written
+reads back as the title memory's bytes, which for GPU-produced textures is nothing: black. The
+three computes that do not translate ("a lane mask exchanged where not every lane runs",
+477b52e73ddeb6f2, 17af85f170e66f30, 8b437ab61d8008fe, 1.3 dispatches a frame each) also write
+BC textures: the same producer, partly dropped twice.
+
+- These views are not bound through per-draw tables: a diagnostic at the table path
+  (`draw.rs` `note_placed_uav_writer`, this commit) saw none in a whole run. They are made for
+  the title's own heap slots and picked by index, so the writer is found through the heap: log
+  the dispatch that binds the heap and the slot's texture (`descriptor/host.rs` `make`, the slot
+  index; the capture listing `VICTORY_CAPTURE` with `VICTORY_CAPTURE_WORLD` names dispatches
+  and their tables).
+- The fix: a host texture for such a title texture that the card can write. Two ways: (a) a
+  placed resource pair on one heap, the BC texture and a `R32G32B32A32_UINT` (BC2/3/5/6/7:
+  16-byte blocks) or `R32G32_UINT` (BC1/4) texture of width/4 x height/4 over the same bytes, the
+  unordered view on the UINT one, an aliasing barrier between uses; (b) `CreateCommittedResource3`
+  with castable formats (needs `ID3D12Device10` and `RelaxedFormatCastingSupported` in
+  `D3D12_FEATURE_D3D12_OPTIONS12`: check it first; `host/place.rs` already asks OPTIONS12 for
+  enhanced barriers). Then the host copy is the source of truth after a shader wrote it: the
+  texture must not be uploaded again from title memory over the GPU's bytes (the texture queue's
+  "changed after its upload with nothing to tell of it: uploaded again" path, 100-170 a run,
+  would do exactly that), and `texback` must not try to tile it back ("a texture copied back
+  could not be tiled e=Unsupported").
+- Also check, cheaper first: `VICTORY_TEXTURE_BUDGET_MB=1536` (settings.local) caps the
+  title-filled texture copies; the queue reports slots "waiting for their memory" (190 at the
+  window shot, 7,500-17,000 while the world loads). Raise it to 2048 and see what the walls do;
+  the copies' room is kept by `card_room_kept` now, so the cap may be unneeded.
+- Done when: a close-up of Lucia's skin and the diner's walls show their textures in the first
+  gameplay (the window shot and what follows), with no "not mirrored" warnings for BC formats.
+
+### Target 2: 20 fps in gameplay
+
+Where it stands (2026-11-27, the window shot, which is the first gameplay): 9 fps, 112 ms a
+frame. The card runs 65-85 ms of it; with `VICTORY_SUBMIT_FRAMES=2` (the title may run one more
+present ahead; not in settings.local, adds a frame of latency) the card's idle falls from 30 to
+17 ms a frame but the frame did not shorten. 20 fps is 50 ms: the card's time must halve and
+the title's own main thread, at 54% of its time in title code at 9 fps (profile `prof3`, about
+60 ms of CPU a frame), must fit too, so some of that must be per-frame-fixed work that shrinks
+with faster frames; measure it before promising 20.
+
+The card's 80 ms by program (timing run 202827, `VICTORY_GPU_TIMING=1 VICTORY_D3D12_DRED=1
+VICTORY_LATE_WAIT=0`): the FSR4 network 8e614708143ef917 11.6 ms in one dispatch (the title
+asserts if its pipeline is refused; its "ACO" path needs `DeserializeComputePipelineStateX`,
+which we answer E_NOTIMPL, so it takes the "NewBE" path; implementing the deserialise, that is
+translating the console shader inside the serialised state, might give it other kernels);
+`ped_skinning_cs` 5.5 ms in 233 dispatches of ~24 us (launch-bound: 32-thread groups, one
+ped piece each); strand hair `smh_*` about 13 ms over ~20 programs; `compute_graph_ops` (the
+facial rig) 5 ms in 331 dispatches of 3 us; our alias copies 2.4 ms in 78; then a tail of 1,300
+kinds, ~8,000 commands, ~30 ms at 3-4 us each. The translator levers, in order of expected gain:
+group doubling (two console groups of 32 in one host group of 64 for kernels without LDS or
+group sync: Turing holds 16 groups per SM, so 32-thread groups run at half occupancy; `emit`
+knows the group size from `native.threads`, the dispatch count is halved in `draw.rs`, indirect
+dispatches need their count halved by the clamp dispatch); fewer, wider raw loads
+(`rawBufferLoad` of one dword where the console loaded four: 45 of 147 in the rigid skinning
+kernel); and the per-kernel work the console's scalar unit did cheaply (uniform loops reading a
+table, 4,096 iterations in the rigid skinning kernel). On the CPU side the submit thread was
+32% busy in the window shot (`send_late`, `submit`, `shadow::wide` refreshes), the eight list
+threads 25-30% each, the relay 15%.
+
+Measured and not worth repeating: barriers (`VICTORY_BARRIER_TEST=both`, no change), a fake GPU
+load for the title's dynamic resolution (none), a 1080p display mode (the title keeps 4K
+targets), `VICTORY_WIDE_THREADS=8` (none), `VICTORY_FILL_TITLE=2` with port 5 (device removed),
+`VICTORY_PLACED_CUT=1` (hangs the title), the builder (`VICTORY_BVH_BUILDER=1`: right lighting,
+5-6 fps, dark interiors, overlapping structures).
+
+### Target 3: moving lips during dialogue
+
+See "Target 2: mouths that move with the spoken lines" above (2026-11-26): the facial pipeline
+is `ped_standard_head_cs` plus the `compute_graph_ops` rig solver, all dispatched every close-up
+frame, translations exact; the audio clock is ruled out. Two things changed since: renderer
+port 5 (constants are now read after the GPU writes them; the rig solver's constants may have
+been stale too, so **look again first**: a line in the diner with the current build), and the
+`sr_tracing` tiling pass now runs. Next step if still shut: read back the blend-shape output
+(`970c4fbb3b017c0e`'s `Uav s0+48`, 1.4 MB) across two frames of a line; if it never changes, test
+the graph ops on WARP one by one.
+
+### Target 4: the stuttering intro animation
+
+See "Target 1: the stutter in the intro animation" above: the thread-priority fix removed the
+0.4-1.3 s freezes, the presents are clean (one 76 ms frame in the 15 s after the press in the
+user's own run 151644), and the user still sees a stutter. Their hypothesis: stale draws showing
+up a couple of milliseconds late (frames repeated or out of order, presents on time). The intro
+after the press is a video uploaded as textures (12.7 MB a frame): a frame that misses its
+upload shows the previous one. Measure the picture, not the presents: `holds.ps1` (the 256x256
+patch hashed at ~60 Hz) across a press made the way the user makes it (three minutes after
+launch, after the loading icon), and `VICTORY_VSYNC=1` as the first experiment (33.7-33.9 ms
+frames on a 59 Hz display without it). Note that the user presses A when the loading icon has
+gone, minutes after launch, not at 14 s as `VICTORY_KEYS=14:Enter` does.
+
+### The build and settings to start from
+
+`rtx-next` at this commit; `tools/runkit/settings.local.ps1` on this PC:
+`VICTORY_CARD_ROOM_FOR_TARGETS_MB=1024 VICTORY_CARD_ROOM_FOR_BUFFERS=1 VICTORY_LAZY_BACK=1
+VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_CARD_BUFFERS_MB=1536 VICTORY_CARD_WINDOWS_MB=1024
+VICTORY_TEXTURE_BUDGET_MB=1536 VICTORY_PORT_CBV=1`. After a translator change: `-Mode warm` with
+the same `-Set`, and the first run builds pipelines in play for about four minutes (the warm
+primes the driver's cache, not the library). The machine: 32 GB of RAM, the process 26-27 GB
+private in the world, a 16-32 GB pagefile set by the user on 2026-11-27 after the 0x1A blue
+screen; keep an eye on "the PC has N MB free" in the `memory:` line.

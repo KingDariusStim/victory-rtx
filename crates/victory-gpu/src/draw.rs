@@ -3550,6 +3550,12 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
+                        #[cfg(feature = "diagnostics")]
+                        if let View::Placed(true, resource, desc) = &view
+                            && resource[0] != 1
+                        {
+                            note_placed_uav_writer(self.pipeline, resource, desc);
+                        }
                         host.make_at(index, &view);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
@@ -4363,6 +4369,24 @@ impl RecordHash {
         let words = u64::from(a) << 32 | u64::from(b);
         let first = fold(self.0 ^ words ^ 0x2d35_8dcc_aa6c_78a5, 0x8bb8_4b93_962e_acc9 ^ u64::from(c));
         self.0 = fold(first ^ 0x4b33_a62e_d433_d4a3, 0x4d5a_2da5_1de1_aa47 ^ self.0.rotate_left(23)) ^ first;
+    }
+}
+
+/// Diagnostics: which pipelines bind an unordered view of a texture the
+/// title placed in memory (such views are not mirrored: their writes are
+/// lost, `descriptor/host.rs`): each pipeline and texture shape once, the
+/// first 48.
+#[cfg(feature = "diagnostics")]
+fn note_placed_uav_writer(pipeline: usize, resource: &[u32; 14], desc: &[u32; 16]) {
+    static SAID: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let Some(p) = crate::pipeline::host_pipeline(pipeline as This) else { return };
+    let key = format!(
+        "{} texture {}x{} depth/mips {:#x} format {} view [{} {} {} {}]",
+        p.name, resource[4], resource[6], resource[7], resource[8], desc[0], desc[1], desc[2], desc[3]
+    );
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if said.len() < 48 && said.insert(key.clone()) {
+        tracing::warn!(%key, "a pipeline binds an unordered view of a texture the title placed (writes through it are lost)");
     }
 }
 
