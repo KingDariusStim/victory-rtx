@@ -66,6 +66,12 @@ pub(crate) struct Shader {
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Left out when asked (`VICTORY_SKIP_HAIR=1`): it animates or draws
+    /// hair strands ([`hair_strands`]), about 10 ms of the card a frame here.
+    /// The list of programs and the way of finding them are cool_fox's
+    /// (DoubleGhosty/cool_fox f4164f8, after codec-d/cool_fox), where they
+    /// are always left out; here only to measure.
+    skipped_kind: bool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -118,9 +124,58 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                skipped_kind: skip_hair() && hair_strands(bytes),
             })
         })
         .clone()
+}
+
+/// `VICTORY_SKIP_HAIR=1`: the programs that animate and draw hair strands
+/// are left out (their draws and dispatches dropped), to measure what they
+/// cost; off by default.
+fn skip_hair() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_HAIR").is_some_and(|v| v == "1"))
+}
+
+/// Whether a container's program is one of those that animate and draw
+/// hair strands, by the name before its `_Wrapped`. The list and the match
+/// are cool_fox's (DoubleGhosty/cool_fox f4164f8 `hair_strands`, after
+/// codec-d/cool_fox).
+fn hair_strands(container: &[u8]) -> bool {
+    const NAMES: [&[u8]; 18] = [
+        b"InterpolateStrand",
+        b"HairStrand",
+        b"CS_VisHair",
+        b"PS_Smh",
+        b"CS_InitSimBuffer",
+        b"CS_PreSkinSim",
+        b"CS_SolvePer",
+        b"CS_WavePerSpline",
+        b"CS_EstimateStartPosition",
+        b"CS_CachePrev",
+        b"CS_RestoreSimVelocity",
+        b"CS_UpdatePosePosition",
+        b"CS_GenerateAccessories",
+        b"CSGenerateHair",
+        b"CS_CalculateFireVolumes",
+        b"CS_ProjDecalCut",
+        b"CS_CullMaskPass",
+        b"CS_LodBlend",
+    ];
+    const END: &[u8] = b"_Wrapped";
+    container
+        .windows(END.len())
+        .enumerate()
+        .filter(|(_, w)| *w == END)
+        .any(|(at, _)| {
+            let before = &container[at.saturating_sub(100)..at];
+            let name = before
+                .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+                .next()
+                .unwrap_or_default();
+            NAMES.iter().any(|n| name.windows(n.len()).any(|w| w == *n))
+        })
 }
 
 /// A translated shader and the console resources its code reads.
@@ -505,12 +560,9 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
-    if hashes.is_empty() {
-        return None;
-    }
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| shader.skipped_kind || !hashes.is_empty() && hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
 }
 
