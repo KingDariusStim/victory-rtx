@@ -140,7 +140,7 @@ fn build() -> [u8; 32] {
             // Without raw twins the slot itself is read raw: another
             // translation.
             if victory_shader::emit::constants_raw_in_slot() {
-                bytes.extend_from_slice(b" in slot");
+                bytes.extend_from_slice(b" in slot 2");
             }
         }
         bytes

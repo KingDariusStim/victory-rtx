@@ -7978,7 +7978,11 @@ impl<'a> Lower<'a> {
     /// or that does not begin a heap slot.
     fn cbv_index(&mut self, load: Site, first: u8, sampler: bool, props: (u32, u32)) -> Option<V> {
         const CONSTANT: u32 = 13;
-        if sampler || props.0 & 0xFF != CONSTANT {
+        const RAW: u32 = 11;
+        // Renderer port 5 reads a table's constant buffer as raw bytes
+        // (`constants_raw`): the same slot of the host's, as a raw view.
+        let constant = props.0 & 0xFF == CONSTANT || (props.0 & 0xFF == RAW && super::shader::constants_raw());
+        if sampler || !constant {
             return None;
         }
         let a = *self.scalar.get(&load)?;
