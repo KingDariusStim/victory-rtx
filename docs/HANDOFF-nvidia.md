@@ -745,3 +745,33 @@ layer has no path to a shutdown API; the crash is the kernel or a driver (the ca
 host copies in system memory) under that pressure, or RAM. Do not run `VICTORY_PORT_CBV=1` again
 until the white picture is understood (a capture of one draw's descriptors would do it), and keep
 commit headroom: a larger pagefile. The reboot at 17:33 the same day was Windows Update.
+
+### Port 5 made to work on NVIDIA (2026-11-27, 00:00-00:30): the hair's colour was the constants
+
+Commits 7eb5dc7 and a82a8f1. Without raw twins (NVIDIA's million-view heaps) the translator now
+reads a table's or a picked constant buffer as raw bytes from its slot itself
+(`constants_raw_in_slot`), the host makes every constant buffer's slot a raw view (dynamic
+slots, in-place and copy-read ones, title slot mirrors, null ones), and `cbv_index` gives the
+host's split index for raw reads too (that was the white picture). `VICTORY_PORT_CBV_COPY` (on
+with the port) reads a table's constant buffer that lies in a card copy out of the copy, its
+range refreshed for the submission. `VICTORY_PORT_CBV=1` is now in `settings.local.ps1`.
+
+What it did: the window shot renders right at last: Lucia's hair dark brown with a rim light,
+the orange INMATE shirt, a dim interior (scratchpad `cbv4`, `walk1`). The glowing orange hair
+was the lighting constants read by the CPU fill before the title's buffer copy at its place in
+the list had put them into the ring; read out of the copy on the card they come after it. So
+"hair blonde/red" and probably "ray tracing through the hair" are closed by this, without the
+builder. The ring fill's 60-80 ms wait is gone (8-9 ms a frame of flight waits remain, 3-4 small
+fills). Frame rate unchanged at 9 fps in the window shot: the card runs 62-80 ms a frame and
+idles 15-30 ms (a ~9.5 ms gap at each present while the last submission's refreshes run, and
+~2.5 ms gaps where a fill waits for landings). Memory: the process is 26-27 GB private with 32 GB
+of RAM; the user set a 16-32 GB pagefile after the 0x1A blue screen.
+
+Tried after: `VICTORY_WIDE_THREADS=8` (no change: 95/108 ms frames against 97/108);
+`VICTORY_FILL_TITLE=2` together with the port **removed the device 21 s in, at the 2D intro**
+(run 201628): leave it off. After any translator change: warm with the same `-Set`, and the first
+run still builds ~2,000 pipelines in play for four minutes (the D3D12 library was rejected
+"created for a different version of the driver" after the Windows Update reboot and rebuilt by
+the runs since; the warm's workers do not save the library, they only prime the driver's cache).
+Scripted W/A keys do not move Lucia at the window; the stick mapping is there
+(`gameinput.rs` `left_y`), so gameplay beyond the window needs a look at why.
