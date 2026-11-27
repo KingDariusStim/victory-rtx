@@ -1016,3 +1016,18 @@ Work taken from, or pointed to by, other trees, with where it came from:
   (NVIDIA fixes, a performance overlay, a Resizable BAR setting), stylexss/VIctory-cool-fox.
 
 Commit messages and doc comments name the source commit wherever a piece was taken.
+
+**Runs 12-15 (23:00-00:05), one switch each at the window shot (Series S, budget 2048):**
+
+| Run | Switch | fps | What changed |
+|---|---|---|---|
+| 230447 | `VICTORY_OUTPUT=1920x1080` (patch applied) | 10.5-11.5 | 4K back buffers and depth stay |
+| 231431 | + `VICTORY_DISPLAY_MODE=1920x1080` | 10-11 | same |
+| 233428 | `VICTORY_LEVELS_ON_DEMAND=1` (tier 4) | 10-11 | worse: interior black at 490 s, card 7.8 of 7.2 GB, 9,663 room-less passes |
+| 235305 | `VICTORY_TEXTURE_GUARD=0` (cool_fox) | 10.3-11.9 | interior fully textured at 519 s; textures 168 MB a frame re-uploaded (14-36 before); preparing 44.6 ms (+12 on the submit thread) |
+
+The texture guard off is the one texture lever that showed: changed textures are re-uploaded
+promptly (cool_fox saw it cure the rainbow forearms and black faces). Its cost is CPU on the submit
+path, invisible while the card is the wall; once the card is faster it will show. Levels on demand
+is not usable here as it stands. The output-size patch does nothing on the Series S profile: run 16
+tries it on Series X.
