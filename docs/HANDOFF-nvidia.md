@@ -1189,3 +1189,12 @@ L", "memory of textures", "the card's clock per frame".
   game. Kill drivers by command line first.
 - `taskkill` from Git Bash needs `//F //PID`.
 - The tools refuse to delete a top-level folder on a drive.
+
+**Addendum 11:25, run 27 (Series X profile, the title's own upscaler at 4K, `VICTORY_BVH_BUILDER=1`):**
+the banding is there too (`shots/sx27/152013.224.jpg`: the sky through the window in blocky patches,
+the left wall in tinted blotches). So it is **not** the Series S upscaler or FSR4. The green/purple
+tint between bands is what 5-6 bits per channel looks like: next suspect is the 16-bit colour
+stand-ins (`resource.rs` `target_format`: B5G5R5A1 86 and B4G4R4A4 115 held as RGBA8; `standin.rs`
+converts copies between the two layouts). Find which pass writes or reads those targets around the
+final image (`VICTORY_CAPTURE` with `VICTORY_CAPTURE_WORLD` lists a frame's passes and their
+targets), and check the conversion in `standin.rs` modes for rounding and channel order.
