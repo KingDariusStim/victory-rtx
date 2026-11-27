@@ -987,3 +987,32 @@ against its own mode table (`VICTORY_DISPLAY_MODE` alone changes nothing); editi
 1920x1080 changed nothing here either (run 225148: 4K targets, 10-11 fps), and the patch alone (run
 230xxx, "patched site=0x224352b ... 1920x1080") still left 2 x 3840x2160 back buffers and one 4K depth
 target, 10.5-11.5 fps. Run 13 tries the patch together with `VICTORY_DISPLAY_MODE=1920x1080`.
+
+## Sources and credit (2026-11-26, late)
+
+Work taken from, or pointed to by, other trees, with where it came from:
+
+- **avatarmanz/VIctory-7900XTX** (upstream, remote `xtx`): renderer ports 5 (`VICTORY_PORT_CBV`,
+  3920dc2, transplanted earlier), 6 (`VICTORY_PORT_GUARD`, fc8ac6c and five commits after it, now
+  cherry-picked on `rtx-next-experiments`, authors kept), the output-size and render-scale switches
+  (`victory-loader/src/resolution.rs`, e151e71 45cad4c 4d7185e, the same branch), the 20 translator
+  commits transplanted on 2026-11-26, levels on demand (`tiles.rs`, with AscilCH's pull request #747
+  fixes), and the light stand-in's idea, which upstream credits to beloooo (VIctory-Belobug-AMD).
+- **Belobug/VIctory-Belobug-AMD** (remote `belobug`): the measured README (22 fps on a 7900 XTX with
+  ports 1, 2, 5, 6, 7; Series S; the output size's 16 ms) that set tonight's order of work; their
+  branch `rx9070xt` is upstream c9c932c plus three commits (RX 9070 XT fixes and a HUD, title textures
+  uploaded in the prelude, a PC FidelityFX 4K path).
+- **codec-d/cool_fox**, carried on by **DoubleGhosty/cool_fox** (remote `cf-dg`; the original
+  repository is gone): the texture guard's part in the garbage skins (`VICTORY_TEXTURE_GUARD=0`, their
+  launcher and commit 0c2ece7), the hair-strand program list and match now behind our opt-in
+  `VICTORY_SKIP_HAIR=1` (f4164f8 `hair_strands`), the rayless screen-probe skip (same commit), the
+  six one-wave computes forced to wave 32 by hash (3c1f8bd), the zero-read recheck of partly mapped
+  textures (c341046, reverted there), and their 8 GB NVIDIA launcher defaults (levels on demand on,
+  `VICTORY_THIN=0 VICTORY_JOIN_PARTS=0 VICTORY_LIBRARY_STORE_LATER=1 VICTORY_PIPELINE_WAIT_MS=0`, Series X
+  profile). Upstream had already taken cool_fox's AMD-safe parts (a12870a: the two-plane compose this
+  tree's overlay fix follows, TablePlan, the per-buffer barrier, residency behind switches).
+- Other forks seen, not yet read: miaohaixiang1-netizen/cool-fox-12gb (`VICTORY_TEXTURE_DROP_MIPS`:
+  the largest levels left out so an 8 GB card keeps the world resident), Zarina35/victory-coolfox-nvidia
+  (NVIDIA fixes, a performance overlay, a Resizable BAR setting), stylexss/VIctory-cool-fox.
+
+Commit messages and doc comments name the source commit wherever a piece was taken.
