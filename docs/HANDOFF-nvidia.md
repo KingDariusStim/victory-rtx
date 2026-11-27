@@ -1039,3 +1039,8 @@ the card 57 ms a frame of 100**, 4,948 draws. So the 4K output passes were never
 card: the card's time is per-object work (skinning, strand hair, the facial rig's graph ops, decals,
 shadows: ~8,000 commands a frame) and it is the same at 720p internal / 1080p output as at 4K. Run
 17 measures the strand hair's share with `VICTORY_SKIP_HAIR=1`.
+
+**Run 17 (001829, Series S, `VICTORY_SKIP_HAIR=1`, the experiments build):** 12-14 fps (80 ms a frame)
+against 10-11, 1,082 draws a frame dropped: the strand hair is worth about 15 ms of the card here.
+The price: Lucia's ponytail is gone, a scalp mesh remains (shots/hair17-016-0488s.png). An option for
+the user, not a default. With it and nothing else the card still needs ~45 ms a frame.
