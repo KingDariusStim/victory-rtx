@@ -944,3 +944,46 @@ landing (the heap pass's "changed after its upload" path), and that the landing 
 buffers at all (table-bound unordered buffer views of dispatches; `VICTORY_WRITE_SKIP`). If no texture
 lies in written memory, the black skin and walls have another cause (the texture budget cap
 `VICTORY_TEXTURE_BUDGET_MB`, slots "waiting for their memory", or the materials' other inputs).
+
+## Black skin and walls are late textures; the frame rate's shape (2026-11-26, 22:00-23:15)
+
+**What the black textures are.** Run 214949's shots: at the window shot (491 s) the whole diner
+interior was black; at 856 s it was textured. The log at 491 s: "passes that made none for lack of
+room: 7650", title-filled copies 1,583 MB at the 1,536 MB cap (`VICTORY_TEXTURE_BUDGET_MB`: with it set,
+`resource::room()` is `filled < limit` and nothing else), the queue 19,744 slots with 1,677 due, the card
+6.76 of 7.21 GB. Copies are let go only when no slot views them, so a cutscene's textures stayed for
+minutes. The user's shots of the club scene: faces and hands black while the shirt is lit, then fine
+seconds later (the handoff's run-4 row said the same: "Lucia's face and skin missing" with "the card has
+no room"). A rainbow-noise forearm is a copy cut from a pooled block showing the block's old bytes
+before its first upload; a shirt fading to black is a texture uploaded in part (the unmapped large
+level uploads zeros). `settings.local.ps1` now has `VICTORY_TEXTURE_BUDGET_MB=2048` (runs 220752 on:
+room-less passes 7,650 -> 1,324, fps unchanged, the card right at its budget). Not done: a slot should
+show nothing (or the levels that are there) rather than stale bytes; `VICTORY_LEVELS_ON_DEMAND=1`
+(`tiles.rs`: levels given memory as the title holds them, "no level is shown before it is written
+whole") is the untried switch for exactly that, and it also frees the memory of unheld levels.
+
+**The frame rate's shape (timing runs 222355 and 223952, `VICTORY_GPU_TIMING_TOP=400` new).** At the
+window shot the card runs 68-70 ms of commands a frame (the normal runs: 94 ms frames, the card 96-98%
+busy, the submit thread 32-40 ms preparing and 18 ms copying back, waiting 16-22 ms for the card). The
+400 kinds listed hold 64 ms in 6,341 commands: top 40 = 32 ms, 41-100 = 16, 101-200 = 10, 201-400 = 7;
+no kind above 4.6 ms. By family: `ped_skinning_cs` 8.6 ms in 477 dispatches, `compute_graph_ops` 6.2
+in 1,085, strand hair (`smh_*`) about 10, our alias copies 2.4 in 78 (R32_UINT views of R9G9B9E5
+targets the host renders as RGBA16F), decal classification 3.8 in one, scattering 2.8, mesh-shader
+draws about 5, `indirect` executions 19-23 ms in 4,500 (5 us each), the FSR4 network only 0.14 ms at
+this shot on Series S. Guards: 627 faults a frame on title threads, 19.5 ms waiting for the guards
+and 8.7 ms changing protections (all threads). The timeline of a normal run has the title's own thread
+"outside our spans" for 68-90 ms of each frame on the present's chain, scaling with the frame: it spins
+on the card. `VICTORY_BARRIER_TEST=both` no longer runs (a list fails to close: parameter incorrect).
+
+**Belobug / upstream, at the user's request (22:45).** belobug/rx9070xt = upstream xtx/main c9c932c +
+3 commits; their README: 45 ms (22 fps) on a 7900 XTX, Series S profile, renderer ports 1, 2, 5, 6, 7,
+the card 36 ms there. A full merge into rtx-next conflicts in 20 files (49 hunks); decided with the
+user: cherry-pick, not merge. Done in `victory_repo/victory-merge` (branch `port6-try` on 302d660):
+port 6 (`VICTORY_PORT_GUARD=1`, the guards' lock shared by faults and refreshes; six commits, conflicts
+in watch.rs resolved, port 2's call dropped) and the output-size patch (`VICTORY_OUTPUT=1920x1080`,
+`victory-loader/src/resolution.rs`, three commits; `Patched` enum of its own since we lack
+`frame_rate.rs`). The title's output size comes from its settings file's `resolutionFullscreen` matched
+against its own mode table (`VICTORY_DISPLAY_MODE` alone changes nothing); editing the file to
+1920x1080 changed nothing here either (run 225148: 4K targets, 10-11 fps), and the patch alone (run
+230xxx, "patched site=0x224352b ... 1920x1080") still left 2 x 3840x2160 back buffers and one 4K depth
+target, 10.5-11.5 fps. Run 13 tries the patch together with `VICTORY_DISPLAY_MODE=1920x1080`.
